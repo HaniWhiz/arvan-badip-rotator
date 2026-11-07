@@ -1,5 +1,5 @@
 import os, sys, json, tempfile, subprocess, types, itertools
-home = tempfile.mkdtemp(); os.environ["ABIP_HOME"] = home; os.environ["ARVAN_API_KEY"] = "Apikey xyz"
+home = tempfile.mkdtemp(); os.chdir(home); os.environ["ABIP_HOME"] = home; os.environ["ARVAN_API_KEY"] = "Apikey xyz"
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import arvin_agent_badip as m
 m.time.sleep = lambda s: None
@@ -95,3 +95,27 @@ assert m.main(["test","--yes"])==1   # refuses with pending
 assert m.main(["cleanup","--yes"])==0
 assert [p["id"] for p in cloud.ports]==["p-mgmt"] and not m.State().pending
 print("ALL OK")
+
+# ---- YAML inputs ----------------------------------------------------------
+repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+tpl = m.load_yaml_inputs(os.path.join(repo, "arvin-agent-badip.yaml"))
+assert tpl["SSH_USER"] == "hani" and tpl["ROUNDS"] == 5 and tpl["PROBE_NODES"] == [] \
+    and tpl["IRAN_CONTROL_TARGET"] == "1.1.1.1:443" and "MANAGEMENT_IP" not in tpl, tpl
+y = os.path.join(home, "in.yaml")
+open(y, "w").write('management_ip: 185.1.1.10   # mgmt\nrounds: 2\nssh_extra_opts:\n  - "-o"\n  - "ProxyJump=b # x"\n'
+                   'check_type: ping\nbaseline_check: no\n')
+d = m.load_yaml_inputs(y)
+assert d == {"MANAGEMENT_IP": "185.1.1.10", "ROUNDS": 2, "SSH_EXTRA_OPTS": ["-o", "ProxyJump=b # x"],
+             "CHECK_TYPE": "ping", "BASELINE_CHECK": False}, d
+for bad in ("rounds: five\n", "api_key: abc\n", "foo: 1\n", "a:\n  b: 1\n"):
+    open(y, "w").write(bad)
+    try:
+        m.load_yaml_inputs(y); raise SystemExit("accepted bad yaml: %r" % bad)
+    except m.AgentError as e:
+        print("rejected:", e)
+open(y, "w").write("rounds: 1\nno_baseline_dummy_removed: 1\n".split("\n")[0] + "\nbaseline_check: false\n")
+n0 = len(cloud.detached)
+assert m.main(["--config", y, "test", "--yes"]) == 0 and len(cloud.detached) == n0 + 1
+open(y, "w").write("management_ip: 185.9.9.9\n")
+assert m.main(["--config", y, "status"]) == 1     # differs from init -> must re-run init
+print("YAML OK")
