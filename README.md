@@ -51,10 +51,36 @@ ssh-add -L
 security add-generic-password -U -a "$USER" -s arvin-agent-badip -w
 #    alternatives: export ARVAN_API_KEY=...   or   ~/arvin-agent-badip/api_key (chmod 600)
 
-# 3. Save the management IP; the server UUID, management port, NIC and gateway are discovered and stored
-./arvin_agent_badip.py init --management-ip 185.x.x.x --ssh-pubkey ~/.ssh/id_ed25519.pub
-#    (add --region ir-thr-ba1 / --server-id UUID if needed; --ssh-user defaults to hani)
+# 3. Fill in the inputs file (at least management_ip, region, ssh_user, ssh_pubkey)
+cp arvin-agent-badip.yaml ~/arvin-agent-badip/config.yaml   # or keep it next to the script
+nano ~/arvin-agent-badip/config.yaml
+
+# 4. Save the management IP; the server UUID, management port, NIC and gateway are discovered and stored
+./arvin_agent_badip.py init
+#    (flags still work and override the file: --management-ip, --region, --server-id, --ssh-user, --ssh-pubkey)
 ```
+
+### Inputs file (`arvin-agent-badip.yaml`)
+
+All inputs are in one flat YAML file. [`arvin-agent-badip.yaml`](arvin-agent-badip.yaml) is the template, with every key commented. The script looks for it in this order:
+1. `--config PATH`
+2. `./arvin-agent-badip.yaml`
+3. `~/arvin-agent-badip/config.yaml`
+
+| Required | Meaning |
+|---|---|
+| `management_ip` | the public IPv4 you SSH to; never released |
+| `region` | ArvanCloud region code, e.g. `ir-thr-ba1` |
+| `ssh_user` | `hani` |
+| `ssh_pubkey` | `.pub` of the ssh-agent key, e.g. `~/.ssh/id_ed25519.pub` |
+
+Everything else is optional: `server_id`, `api_key_file`, `rounds`, `checks_per_ip`, `check_type`, `check_port`, timeouts, and so on.
+
+Values override in this order, lowest first: script defaults, then what `init` discovered, then the YAML file, then command-line flags. An empty value keeps the default.
+
+**The API key itself is refused in this file.** Use the Keychain, `api_key_file` (chmod 600) or `$ARVAN_API_KEY`.
+
+If you change `management_ip` after `init`, the script stops until you run `init` again.
 
 On the VM, `hani` needs **passwordless sudo**, at least for `ip`, `sysctl`, `sh` and `touch`. The VM also needs `ip` and `curl` (or `wget`), and sshd must listen on `0.0.0.0:22`, because check-host probes the test IP on port 22. `preflight` checks all of this.
 
@@ -82,6 +108,7 @@ Exit codes: `0` ok · `1` error · `2` the run stopped early, or something is st
 
 | File | Content |
 |---|---|
+| `config.yaml` | your inputs (optional location, see above) |
 | `config.json` | management IP, server ID, management port, NIC, gateway, SSH user and key (written by `init`). Any key from `DEFAULTS` in the script can be added, e.g. `"ROUNDS": 10` |
 | `results.csv` / `results.jsonl` | one row per tested IP: verdict, cycle counts, egress check, TCP check from the Mac, `seen_before` (Arvan handed out the same IP again), check-host report links |
 | `checks.jsonl` | every check-host cycle, with per-node results |

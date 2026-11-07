@@ -1,0 +1,76 @@
+# arvin-agent-badip: inputs
+#
+# Copy this file next to the script (./arvin-agent-badip.yaml) or to
+# ~/arvin-agent-badip/config.yaml, or pass it with:  --config /path/to/file.yaml
+#
+# Precedence: script defaults < values found by `init` < this file < command-line flags.
+# Leave a value empty to keep the default. Keep the file flat (no nesting).
+#
+# The ArvanCloud API key does NOT go in this file. Store it in the macOS Keychain:
+#   security add-generic-password -U -a "$USER" -s arvin-agent-badip -w
+# or set api_key_file below, or export ARVAN_API_KEY.
+
+# =============================================================================
+# REQUIRED: you must fill these in
+# =============================================================================
+
+# Public IPv4 you SSH to. It is saved as the management IP and is never released.
+management_ip: ""                 # e.g. 185.x.x.x
+
+# ArvanCloud region code of the server (shown in the panel / API).
+region: ir-thr-ba1
+
+# SSH access to the VM (user hani + a key loaded in your macOS ssh-agent).
+ssh_user: hani
+ssh_pubkey: ~/.ssh/id_ed25519.pub # the .pub of the agent key to use; empty = any agent key
+
+# =============================================================================
+# OPTIONAL: credentials and access
+# =============================================================================
+
+# File holding the ArvanCloud API key (must be chmod 600). Empty = use
+# $ARVAN_API_KEY, then ~/arvin-agent-badip/api_key, then the macOS Keychain.
+api_key_file: ""
+
+# Server UUID. Empty = `init` finds the server that owns management_ip.
+server_id: ""
+
+ssh_port: 22
+sudo: "sudo -n"                   # "" if ssh_user is root
+ssh_extra_opts: []                # e.g. ["-o", "ProxyJump=bastion.example"]
+
+# =============================================================================
+# OPTIONAL: test run
+# =============================================================================
+
+rounds: 5                         # how many test IPs per run (allocate -> test -> release)
+checks_per_ip: 2                  # check-host cycles per test IP
+round_spacing_sec: 60             # pause between rounds
+baseline_check: true              # also probe the management IP once per run
+
+# How "reachable from Iran" is tested (sshd already listens on 0.0.0.0:22).
+check_type: tcp                   # tcp | ping | http
+check_port: 22
+check_http_path: /                # only for check_type: http
+
+# =============================================================================
+# OPTIONAL: verdict tuning (defaults are usually fine)
+# =============================================================================
+
+min_conclusive_nodes: 3           # Iranian nodes needed for a verdict
+fail_ratio_threshold: 0.5         # blocked if more than this share of Iranian nodes fail
+probe_max_nodes: 10
+probe_nodes: []                   # [] = all check-host nodes in Iran (auto)
+control_nodes: []                 # [] = 3 nodes outside Iran (auto)
+iran_control_target: "1.1.1.1:443"
+
+# =============================================================================
+# OPTIONAL: safety and timing
+# =============================================================================
+
+protect_mgmt_route: true          # pin the management IP's replies to its own NIC
+mgmt_watchdog_sec: 90             # VM auto-reverts the pin if a fresh SSH can't confirm it
+max_public_ips_per_server: 4      # ArvanCloud per-server cap
+nic_appear_timeout_sec: 120
+port_active_timeout_sec: 180
+release_timeout_sec: 180

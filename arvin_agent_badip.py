@@ -72,6 +72,7 @@ DEFAULTS: Dict[str, Any] = {
     # ---- ArvanCloud panel (API key) ---------------------------------------
     "ARVAN_API_BASE": "https://napi.arvancloud.ir/ecc/v1",
     "API_KEY_PREFIX": "Apikey ",
+    "API_KEY_FILE": "",               # optional file holding the key (chmod 600)
     "REGION": "ir-thr-ba1",
     "SERVER_ID": "",                  # found by `init` from the management IP
     "SERVER_NAME": "",
@@ -208,9 +209,157 @@ def config_path() -> str:
     return os.path.join(HOME_DIR, "config.json")
 
 
-def load_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+# ---- YAML input file ---------------------------------------------------------
+# A small parser for the flat YAML used by arvin-agent-badip.yaml (stdlib only):
+#   key: value        scalars: "quoted", 'quoted', bare strings, ints, floats,
+#                     true/false/yes/no, null/~ or empty
+#   key: [a, b]       inline list
+#   key:              block list
+#     - a
+# Comments (#) and blank lines are ignored. Nested mappings are rejected.
+YAML_SEARCH = ["arvin-agent-badip.yaml", os.path.join(HOME_DIR, "config.yaml")]
+
+
+def _yaml_strip_comment(line: str) -> str:
+    q = None
+    for i, ch in enumerate(line):
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i].rstrip()
+    return line.rstrip()
+
+
+def _yaml_scalar(v: str, where: str) -> Any:
+    v = v.strip()
+    if v == "" or v in ("~", "null", "Null", "NULL"):
+        return None
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1].strip()
+        return [_yaml_scalar(x, where) for x in _yaml_split(inner)] if inner else []
+    if v.startswith(("{", "&", "*", "|", ">")):
+        raise AgentError("%s: unsupported YAML value %r (keep the file flat)" % (where, v))
+    low = v.lower()
+    if low in ("true", "yes", "on"):
+        return True
+    if low in ("false", "no", "off"):
+        return False
+    if re.fullmatch(r"[-+]?\d+", v):
+        return int(v)
+    if re.fullmatch(r"[-+]?(\d+\.\d*|\.\d+)([eE][-+]?\d+)?", v):
+        return float(v)
+    return v
+
+
+def _yaml_split(s: str) -> List[str]:
+    out, cur, q = [], "", None
+    for ch in s:
+        if q:
+            cur += ch
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+            cur += ch
+        elif ch == ",":
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    out.append(cur)
+    return [x.strip() for x in out]
+
+
+def parse_simple_yaml(text: str, src: str = "yaml") -> Dict[str, Any]:
+    data: Dict[str, Any] = {}
+    list_key: Optional[str] = None
+    for n, raw in enumerate(text.splitlines(), 1):
+        where = "%s line %d" % (src, n)
+        if "\t" in raw[: len(raw) - len(raw.lstrip())]:
+            raise AgentError("%s: use spaces, not tabs, for indentation" % where)
+        line = _yaml_strip_comment(raw)
+        if not line.strip() or line.strip() in ("---", "..."):
+            continue
+        if line.lstrip().startswith("- "):
+            if list_key is None or not raw.startswith((" ", "-")):
+                raise AgentError("%s: list item without a key above it" % where)
+            data[list_key].append(_yaml_scalar(line.lstrip()[2:], where))
+            continue
+        if line[0] == " ":
+            raise AgentError("%s: nested values are not supported (keep the file flat)" % where)
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:(\s+(.*))?$", line)
+        if not m:
+            raise AgentError("%s: expected 'key: value', got %r" % (where, line))
+        key, val = m.group(1), (m.group(3) or "")
+        if key in data:
+            raise AgentError("%s: duplicate key %r" % (where, key))
+        if val.strip() == "":
+            data[key], list_key = [], key       # may become a block list; fixed below
+            continue
+        data[key], list_key = _yaml_scalar(val, where), None
+    # an empty "key:" that never got list items means null
+    for k, v in list(data.items()):
+        if v == [] and not re.search(r"^%s\s*:\s*\[\s*\]" % re.escape(k), text, re.M):
+            data[k] = None
+    return data
+
+
+def find_yaml(explicit: Optional[str]) -> Optional[str]:
+    if explicit:
+        p = os.path.expanduser(explicit)
+        if not os.path.isfile(p):
+            raise AgentError("config file %s not found" % p)
+        return p
+    for p in YAML_SEARCH:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def load_yaml_inputs(path: str) -> Dict[str, Any]:
+    with open(path, encoding="utf-8") as fh:
+        raw = parse_simple_yaml(fh.read(), path)
+    if any(k.lower() in ("api_key", "apikey", "arvan_api_key") for k in raw):
+        raise AgentError("%s: do not put the API key itself in this file; use api_key_file "
+                         "or the macOS Keychain" % path)
+    out: Dict[str, Any] = {}
+    unknown = []
+    for k, v in raw.items():
+        K = k.upper()
+        if K not in DEFAULTS:
+            unknown.append(k)
+            continue
+        if v is None or (v == "" and K != "SUDO"):
+            continue                              # empty -> keep the default / init value
+        d = DEFAULTS[K]
+        if isinstance(d, bool):
+            ok = isinstance(v, bool)
+        elif isinstance(d, (int, float)):
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool)
+        elif isinstance(d, list):
+            ok = isinstance(v, list)
+        else:
+            ok = True
+            v = str(v)
+        if not ok:
+            raise AgentError("%s: %s should be %s, got %r" % (path, k, type(d).__name__, v))
+        out[K] = v
+    if unknown:
+        raise AgentError("%s: unknown key(s): %s" % (path, ", ".join(unknown)))
+    return out
+
+
+def load_config(overrides: Optional[Dict[str, Any]] = None, yaml_path: Optional[str] = None,
+                for_init: bool = False) -> Dict[str, Any]:
+    """DEFAULTS < config.json (found by `init`) < YAML inputs < CLI flags."""
     cfg = copy.deepcopy(DEFAULTS)
     p = config_path()
+    saved: Dict[str, Any] = {}
     if os.path.isfile(p):
         with open(p, encoding="utf-8") as fh:
             saved = json.load(fh)
@@ -218,9 +367,16 @@ def load_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if unknown:
             raise AgentError("unknown key(s) in %s: %s" % (p, ", ".join(unknown)))
         cfg.update(saved)
+    ypath = find_yaml(yaml_path)
+    if ypath:
+        cfg.update(load_yaml_inputs(ypath))
     for k, v in (overrides or {}).items():
         if v is not None:
             cfg[k] = v
+    cfg["_YAML_PATH"] = ypath or ""
+    if not for_init and saved.get("MANAGEMENT_IP") and cfg["MANAGEMENT_IP"] != saved["MANAGEMENT_IP"]:
+        raise AgentError("management_ip is now %s but `init` was run for %s; run `%s init` again"
+                         % (cfg["MANAGEMENT_IP"], saved["MANAGEMENT_IP"], PROJECT))
     return cfg
 
 
@@ -314,8 +470,8 @@ def load_results() -> List[Dict[str, Any]]:
 # =============================================================================
 # Secrets: the ArvanCloud API key
 # =============================================================================
-def load_api_key() -> Tuple[Optional[str], str]:
-    """$ARVAN_API_KEY -> <HOME>/api_key (chmod 600) -> macOS Keychain."""
+def load_api_key(key_file: str = "") -> Tuple[Optional[str], str]:
+    """$ARVAN_API_KEY -> api_key_file / <HOME>/api_key (chmod 600) -> macOS Keychain."""
     def strip(v: str) -> str:
         v = v.strip()
         return v[7:].strip() if v.lower().startswith("apikey ") else v
@@ -323,7 +479,9 @@ def load_api_key() -> Tuple[Optional[str], str]:
     v = os.environ.get("ARVAN_API_KEY", "").strip()
     if v:
         return strip(v), "env:$ARVAN_API_KEY"
-    p = os.path.join(HOME_DIR, "api_key")
+    p = os.path.expanduser(key_file) if key_file else os.path.join(HOME_DIR, "api_key")
+    if key_file and not os.path.isfile(p):
+        raise AgentError("api_key_file %s not found" % p)
     if os.path.isfile(p):
         mode = os.stat(p).st_mode
         if mode & 0o077:
@@ -988,7 +1146,7 @@ class Agent:
                  need_key: bool = True):
         self.cfg, self.log, self.dry_run = cfg, log, dry_run
         self.http = Http(cfg, log, read_only=dry_run)
-        key, src = load_api_key()
+        key, src = load_api_key(cfg.get("API_KEY_FILE") or "")
         if need_key and not key:
             raise AgentError("ArvanCloud API key " + src)
         self.key_source = src
@@ -1512,10 +1670,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--ssh-user")
     ap.add_argument("--ssh-pubkey", help="public key (.pub) of the ssh-agent key to use")
     ap.add_argument("--ssh-port", type=int)
+    ap.add_argument("-c", "--config", help="YAML inputs file (default: ./arvin-agent-badip.yaml, "
+                                           "then ~/arvin-agent-badip/config.yaml)")
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("init", help="save the management IP and find the server")
-    p.add_argument("--management-ip", required=True)
+    p.add_argument("--management-ip", help="default: management_ip from the YAML file")
     p.add_argument("--server-id")
     sub.add_parser("preflight", help="read-only checks: API key, server, SSH, sudo, check-host")
     p = sub.add_parser("test", help="allocate, test and release test IPs (billable)")
@@ -1543,7 +1703,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.cmd == "init":
         ov["SERVER_ID"] = a.server_id
     try:
-        cfg = load_config(ov)
+        cfg = load_config(ov, a.config, for_init=(a.cmd == "init"))
         log = EventLog(cfg, quiet=a.cmd in ("results", "status"))
         if a.cmd == "results":
             rows = load_results()
@@ -1562,12 +1722,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                                                          "MANAGEMENT_GATEWAY", "SSH_USER", "SSH_PUBKEY",
                                                          "ROUNDS", "CHECKS_PER_IP", "CHECK_TYPE", "CHECK_PORT")}),
                              indent=2))
+            print("inputs :", cfg.get("_YAML_PATH") or "(no YAML file found)")
             print("home   :", HOME_DIR)
             print("pending:", json.dumps(st.pending) if st.pending else "none")
             return 0
         agent = Agent(cfg, log, dry_run=(a.cmd == "test" and a.dry_run))
         if a.cmd == "init":
-            return agent.init(a.management_ip)
+            mip = a.management_ip or cfg.get("MANAGEMENT_IP")
+            if not mip:
+                raise AgentError("give --management-ip or set management_ip in the YAML file")
+            return agent.init(mip)
         if a.cmd == "preflight":
             return agent.preflight()
         if a.cmd == "cleanup":
