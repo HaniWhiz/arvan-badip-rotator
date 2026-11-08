@@ -6,37 +6,49 @@
 # Precedence: script defaults < values found by `init` < this file < command-line flags.
 # Leave a value empty to keep the default. Keep the file flat (no nesting).
 #
-# The ArvanCloud API key does NOT go in this file. Store it in the macOS Keychain:
+# Secrets: api_key and ssh_key below accept EITHER a file path OR the value itself.
+# A value written here is stored in plain text: keep this file private (chmod 600).
+# On macOS you can instead leave api_key empty and keep the key in the Keychain:
 #   security add-generic-password -U -a "$USER" -s arvin-agent-badip -w
-# or set api_key_file below, or export ARVAN_API_KEY.
 
 # =============================================================================
 # REQUIRED: you must fill these in
 # =============================================================================
 
-# Public IPv4 you SSH to. It is saved as the management IP and is never released.
-management_ip: ""                 # e.g. 185.x.x.x
+# Public IPv4 you SSH to (saved as the management IP, never released).
+# Several servers: separate them with commas. Each one is tested in turn.
+management_ip: ""                 # e.g. "185.1.1.10" or "185.1.1.10, 185.2.2.20"
 
 # ArvanCloud region code of the server (shown in the panel / API).
 region: ir-thr-ba1
 
-# SSH access to the VM (user hani + a key loaded in your macOS ssh-agent).
+# SSH access to the VM(s). The same user and key are used for every server.
 ssh_user: hani
-ssh_pubkey: ~/.ssh/id_ed25519.pub # the .pub of the agent key to use; empty = any agent key
+# ssh_key, any of:
+#   ~/.ssh/id_ed25519.pub              .pub of a key in your ssh-agent (macOS default)
+#   ~/.ssh/id_ed25519                  private key file (no agent needed)
+#   ssh-ed25519 AAAAC3Nz... me@mac     the public key line itself (agent must hold it)
+#   "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl...\n-----END OPENSSH PRIVATE KEY-----"
+#                                      the private key itself, \n for each line break
+#   empty                              any key in the ssh-agent
+ssh_key: ~/.ssh/id_ed25519.pub
 
 # =============================================================================
 # OPTIONAL: credentials and access
 # =============================================================================
 
-# File holding the ArvanCloud API key (must be chmod 600). Empty = use
-# $ARVAN_API_KEY, then ~/arvin-agent-badip/api_key, then the macOS Keychain.
-api_key_file: ""
+# ArvanCloud API key (panel access), either:
+#   the key itself:   "apikey 0000000-0000-0000-0000-000000000000"  (the "apikey " prefix is optional)
+#   a file path:      ~/arvin-agent-badip/api_key   (file with only the key; chmod 600)
+# Empty = $ARVAN_API_KEY, then ~/arvin-agent-badip/api_key, then the macOS Keychain.
+api_key: ""
 
-# Server UUID. Empty = `init` finds the server that owns management_ip.
+# Server UUID(s). Empty = `init` finds the server that owns each management IP.
+# Several servers: one UUID per management IP, comma-separated, same order.
 server_id: ""
 
 ssh_port: 22
-sudo: "sudo -n"                   # "" if ssh_user is root
+sudo: "sudo -n"                   # ignored when ssh_user is root
 ssh_extra_opts: []                # e.g. ["-o", "ProxyJump=bastion.example"]
 
 # =============================================================================

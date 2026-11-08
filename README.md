@@ -2,12 +2,12 @@
 
 `arvin-agent-badip` finds out whether the public IPv4 addresses ArvanCloud gives your server are **reachable from Iran (GOOD)** or **blocked (BAD)**. Each run allocates a test IP, tests it, releases it, and saves the result. It does this `ROUNDS` times (5 by default).
 
-The tool is one file, `arvin_agent_badip.py`, and needs only the Python 3.8+ standard library. It runs on **your Mac**, not on the server.
+The tool is one file, `arvin_agent_badip.py`, and needs only the Python 3.8+ standard library. It runs on **your Mac**, not on the server. It can test **several servers** in one run: list their management IPs separated by commas.
 
 | Credential | Gives access to | Used for |
 |---|---|---|
 | ArvanCloud **API key** | the panel | add and remove public IPs, read ports, networks and subnets |
-| SSH as **`hani`** with your **macOS ssh-agent** key | the VM itself, through the saved **management IP** | bring each test IP up on its NIC, check its egress, then remove it |
+| SSH as **`hani`** with your **macOS ssh-agent** key (or a key file, or the key itself) | the VM itself, through the saved **management IP** | bring each test IP up on its NIC, check its egress, then remove it |
 
 The management IP is never released, and neither is its port or any port that existed before a round. Only the port the round created is released.
 
@@ -49,15 +49,17 @@ ssh-add -L
 
 # 2. API key in the macOS Keychain (paste it at the prompt; it never goes into a file or the shell history)
 security add-generic-password -U -a "$USER" -s arvin-agent-badip -w
-#    alternatives: export ARVAN_API_KEY=...   or   ~/arvin-agent-badip/api_key (chmod 600)
+#    alternatives: api_key in the YAML file (the key or a file path), or export ARVAN_API_KEY=...
 
-# 3. Fill in the inputs file (at least management_ip, region, ssh_user, ssh_pubkey)
+# 3. Fill in the inputs file (at least management_ip, region, ssh_user, ssh_key)
+mkdir -p ~/arvin-agent-badip
 cp arvin-agent-badip.yaml ~/arvin-agent-badip/config.yaml   # or keep it next to the script
+chmod 600 ~/arvin-agent-badip/config.yaml
 nano ~/arvin-agent-badip/config.yaml
 
-# 4. Save the management IP; the server UUID, management port, NIC and gateway are discovered and stored
+# 4. Save each management IP; the server UUID, management port, NIC and gateway are discovered and stored
 ./arvin_agent_badip.py init
-#    (flags still work and override the file: --management-ip, --region, --server-id, --ssh-user, --ssh-pubkey)
+#    (flags override the file: --management-ip, --region, --server-id, --ssh-user, --ssh-key, --server)
 ```
 
 ### Inputs file (`arvin-agent-badip.yaml`)
@@ -69,22 +71,33 @@ All inputs are in one flat YAML file. [`arvin-agent-badip.yaml`](arvin-agent-bad
 
 | Required | Meaning |
 |---|---|
-| `management_ip` | the public IPv4 you SSH to; never released |
+| `management_ip` | the public IPv4 you SSH to; never released. Several servers: `"185.1.1.10, 185.2.2.20"` |
 | `region` | ArvanCloud region code, e.g. `ir-thr-ba1` |
 | `ssh_user` | `hani` |
-| `ssh_pubkey` | `.pub` of the ssh-agent key, e.g. `~/.ssh/id_ed25519.pub` |
+| `ssh_key` | see below |
 
-Everything else is optional: `server_id`, `api_key_file`, `rounds`, `checks_per_ip`, `check_type`, `check_port`, timeouts, and so on.
+Everything else is optional: `api_key`, `server_id`, `rounds`, `checks_per_ip`, `check_type`, `check_port`, timeouts, and so on.
+
+**`api_key` and `ssh_key` each accept a file path or the value itself:**
+
+| Field | File path | Value itself |
+|---|---|---|
+| `api_key` | `~/arvin-agent-badip/api_key` (a file holding only the key, chmod 600) | `"apikey 0000…"` (the `apikey ` prefix is optional) |
+| `ssh_key` | `~/.ssh/id_ed25519.pub` (ssh-agent key) or `~/.ssh/id_ed25519` (private key file, no agent needed) | `ssh-ed25519 AAAA… me@mac` (agent must hold it), or the private key with `\n` for each line break |
+
+A value written into the YAML file is stored in plain text, so `chmod 600` the file. If `api_key` is empty, the key comes from `$ARVAN_API_KEY`, then `~/arvin-agent-badip/api_key`, then the Keychain. If `ssh_key` is empty, any key in the agent is tried. (`api_key_file` and `ssh_pubkey` still work as older names.)
+
+**Several servers:**
+- Every command runs over each management IP in turn. `--server IP` limits a command to one of them.
+- `server_id` is optional. If you set it, give one UUID per IP, in the same order.
+- `test` stops before the next server if an IP is left pending.
+- Results get a `server` column.
 
 Values override in this order, lowest first: script defaults, then what `init` discovered, then the YAML file, then command-line flags. An empty value keeps the default.
 
-**The API key itself is refused in this file.** Use the Keychain, `api_key_file` (chmod 600) or `$ARVAN_API_KEY`.
-
-If you change `management_ip` after `init`, the script stops until you run `init` again.
-
 On the VM, `hani` needs **passwordless sudo**, at least for `ip`, `sysctl`, `sh` and `touch`. The VM also needs `ip` and `curl` (or `wget`), and sshd must listen on `0.0.0.0:22`, because check-host probes the test IP on port 22. `preflight` checks all of this.
 
-`--ssh-pubkey` points at the **.pub** file. ssh then asks the agent for exactly that key (`IdentitiesOnly=yes`). If you leave it out, any key in the agent is tried.
+With a `.pub` key, ssh asks the agent for exactly that key (`IdentitiesOnly=yes`).
 
 ## Use
 
@@ -94,6 +107,7 @@ On the VM, `hani` needs **passwordless sudo**, at least for `ip`, `sysctl`, `sh`
 ./arvin_agent_badip.py test --rounds 1 --yes  # one billable round first
 ./arvin_agent_badip.py test --yes             # 5 rounds
 ./arvin_agent_badip.py results                # all results;  --bad / --good / --last N
+./arvin_agent_badip.py --server 185.1.1.10 test --yes   # only one of the listed servers
 ./arvin_agent_badip.py status                 # saved config + anything pending
 ./arvin_agent_badip.py cleanup --yes          # release a test IP left behind by a crash
 ```
@@ -109,11 +123,12 @@ Exit codes: `0` ok · `1` error · `2` the run stopped early, or something is st
 | File | Content |
 |---|---|
 | `config.yaml` | your inputs (optional location, see above) |
-| `config.json` | management IP, server ID, management port, NIC, gateway, SSH user and key (written by `init`). Any key from `DEFAULTS` in the script can be added, e.g. `"ROUNDS": 10` |
+| `servers/<ip>/config.json` | per server: server ID, management port, NIC, gateway (written by `init`) |
+| `servers/<ip>/state.json` | per server: the allocation in flight (if any) |
+| `keys/` | key files written from key *values* given in the YAML file |
 | `results.csv` / `results.jsonl` | one row per tested IP: verdict, cycle counts, egress check, TCP check from the Mac, `seen_before` (Arvan handed out the same IP again), check-host report links |
 | `checks.jsonl` | every check-host cycle, with per-node results |
 | `events.jsonl` | every action |
-| `state.json` | the allocation in flight (if any) |
 
 ## Not verified yet
 

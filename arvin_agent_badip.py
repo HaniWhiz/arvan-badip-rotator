@@ -7,8 +7,9 @@ are reachable from Iran ("good") or blocked ("bad").
 It runs on your Mac, not on the server. It uses two separate credentials:
 
   * ArvanCloud API key   -> panel access: add and remove public IPs.
-  * SSH user "hani" with the key in your macOS ssh-agent -> access to the VM
-    itself, through the saved MANAGEMENT IP, to bring each test IP up on the NIC.
+  * SSH user "hani" with the key in your macOS ssh-agent (or any key file / key
+    value) -> access to the VM itself, through the saved MANAGEMENT IP, to bring
+    each test IP up on the NIC. Several servers: comma-separated management IPs.
 
 One test run does ROUNDS rounds (default 5). Each round:
 
@@ -72,14 +73,15 @@ DEFAULTS: Dict[str, Any] = {
     # ---- ArvanCloud panel (API key) ---------------------------------------
     "ARVAN_API_BASE": "https://napi.arvancloud.ir/ecc/v1",
     "API_KEY_PREFIX": "Apikey ",
-    "API_KEY_FILE": "",               # optional file holding the key (chmod 600)
+    "API_KEY": "",                    # the key itself OR the path of a file holding it
+    "API_KEY_FILE": "",               # old name of API_KEY (value or path accepted)
     "REGION": "ir-thr-ba1",
     "SERVER_ID": "",                  # found by `init` from the management IP
     "SERVER_NAME": "",
     "IP_TYPE": "ipv4",
 
     # ---- Management access (never released) -------------------------------
-    "MANAGEMENT_IP": "",
+    "MANAGEMENT_IP": "",              # one IP, or several servers: "1.2.3.4, 5.6.7.8"
     "MANAGEMENT_PORT_ID": "",         # filled by `init`
     "MANAGEMENT_IFACE": "",           # filled by `init` (from the VM)
     "MANAGEMENT_GATEWAY": "",         # filled by `init` (from the VM)
@@ -95,6 +97,9 @@ DEFAULTS: Dict[str, Any] = {
     # Path to the PUBLIC key (.pub) of the ssh-agent key to use. ssh then asks
     # the agent for exactly that key (IdentitiesOnly). "" = any agent key.
     "SSH_PUBKEY": "",
+    # SSH_KEY: a path (private key, or .pub of an agent key) OR the key itself
+    # (a one-line public key, or a private key with \n for line breaks).
+    "SSH_KEY": "",
     "SSH_BIN": "ssh",
     "SSH_CONNECT_TIMEOUT": 10,
     "SSH_EXTRA_OPTS": [],             # e.g. ["-o", "ProxyJump=bastion"]
@@ -149,6 +154,7 @@ DEFAULTS: Dict[str, Any] = {
     "LOG_LEVEL": "info",
 }
 
+IS_WINDOWS = os.name == "nt"
 HOME_DIR = os.path.expanduser(os.environ.get("ABIP_HOME", "~/" + PROJECT))
 KEYCHAIN_SERVICE = PROJECT
 
@@ -205,8 +211,43 @@ def _write_json_atomic(path: str, data: Any) -> None:
     os.replace(tmp, path)
 
 
-def config_path() -> str:
-    return os.path.join(HOME_DIR, "config.json")
+def server_dir(ip: str) -> str:
+    return os.path.join(HOME_DIR, "servers", ip)
+
+
+def config_path(ip: str) -> str:
+    """What `init` found for one server (server id, mgmt port, NIC, gateway)."""
+    return os.path.join(server_dir(ip), "config.json")
+
+
+def parse_ip_list(value: Any) -> List[str]:
+    items = value if isinstance(value, list) else re.split(r"[,\s;]+", str(value or ""))
+    out: List[str] = []
+    for x in items:
+        x = str(x).strip()
+        if not x:
+            continue
+        if not _is_ipv4(x):
+            raise AgentError("management_ip: %r is not an IPv4 address" % x)
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def _migrate_legacy() -> None:
+    """Move a single-server config.json/state.json from v1.0 into servers/<ip>/."""
+    old = os.path.join(HOME_DIR, "config.json")
+    if not os.path.isfile(old):
+        return
+    with contextlib.suppress(OSError, ValueError):
+        with open(old, encoding="utf-8") as fh:
+            ip = json.load(fh).get("MANAGEMENT_IP")
+        if ip and not os.path.exists(config_path(ip)):
+            os.makedirs(server_dir(ip), exist_ok=True)
+            os.replace(old, config_path(ip))
+            st = os.path.join(HOME_DIR, "state.json")
+            if os.path.isfile(st):
+                os.replace(st, os.path.join(server_dir(ip), "state.json"))
 
 
 # ---- YAML input file ---------------------------------------------------------
@@ -324,9 +365,6 @@ def find_yaml(explicit: Optional[str]) -> Optional[str]:
 def load_yaml_inputs(path: str) -> Dict[str, Any]:
     with open(path, encoding="utf-8") as fh:
         raw = parse_simple_yaml(fh.read(), path)
-    if any(k.lower() in ("api_key", "apikey", "arvan_api_key") for k in raw):
-        raise AgentError("%s: do not put the API key itself in this file; use api_key_file "
-                         "or the macOS Keychain" % path)
     out: Dict[str, Any] = {}
     unknown = []
     for k, v in raw.items():
@@ -336,6 +374,8 @@ def load_yaml_inputs(path: str) -> Dict[str, Any]:
             continue
         if v is None or (v == "" and K != "SUDO"):
             continue                              # empty -> keep the default / init value
+        if isinstance(v, list) and K in ("MANAGEMENT_IP", "SERVER_ID"):
+            v = ",".join(str(x) for x in v)       # [ip1, ip2] works as well as "ip1, ip2"
         d = DEFAULTS[K]
         if isinstance(d, bool):
             ok = isinstance(v, bool)
@@ -354,19 +394,11 @@ def load_yaml_inputs(path: str) -> Dict[str, Any]:
     return out
 
 
-def load_config(overrides: Optional[Dict[str, Any]] = None, yaml_path: Optional[str] = None,
-                for_init: bool = False) -> Dict[str, Any]:
-    """DEFAULTS < config.json (found by `init`) < YAML inputs < CLI flags."""
+def load_config(overrides: Optional[Dict[str, Any]] = None,
+                yaml_path: Optional[str] = None) -> Dict[str, Any]:
+    """Global inputs: DEFAULTS < YAML inputs < CLI flags (MANAGEMENT_IP may list several)."""
+    _migrate_legacy()
     cfg = copy.deepcopy(DEFAULTS)
-    p = config_path()
-    saved: Dict[str, Any] = {}
-    if os.path.isfile(p):
-        with open(p, encoding="utf-8") as fh:
-            saved = json.load(fh)
-        unknown = [k for k in saved if k not in DEFAULTS]
-        if unknown:
-            raise AgentError("unknown key(s) in %s: %s" % (p, ", ".join(unknown)))
-        cfg.update(saved)
     ypath = find_yaml(yaml_path)
     if ypath:
         cfg.update(load_yaml_inputs(ypath))
@@ -374,9 +406,39 @@ def load_config(overrides: Optional[Dict[str, Any]] = None, yaml_path: Optional[
         if v is not None:
             cfg[k] = v
     cfg["_YAML_PATH"] = ypath or ""
-    if not for_init and saved.get("MANAGEMENT_IP") and cfg["MANAGEMENT_IP"] != saved["MANAGEMENT_IP"]:
-        raise AgentError("management_ip is now %s but `init` was run for %s; run `%s init` again"
-                         % (cfg["MANAGEMENT_IP"], saved["MANAGEMENT_IP"], PROJECT))
+    return cfg
+
+
+def server_config(base: Dict[str, Any], ip: str, index: int, count: int) -> Dict[str, Any]:
+    """Per-server config: DEFAULTS < saved by `init` < YAML < CLI, with MANAGEMENT_IP = ip."""
+    cfg = copy.deepcopy(DEFAULTS)
+    p = config_path(ip)
+    if os.path.isfile(p):
+        with open(p, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        unknown = [k for k in saved if k not in DEFAULTS]
+        if unknown:
+            raise AgentError("unknown key(s) in %s: %s" % (p, ", ".join(unknown)))
+        cfg.update(saved)
+    saved_sid = cfg.get("SERVER_ID") or ""
+    for k, v in base.items():
+        if k == "SERVER_ID" or v == DEFAULTS.get(k, object()):
+            continue
+        cfg[k] = v
+    cfg["MANAGEMENT_IP"] = ip
+    cfg["_YAML_PATH"] = base.get("_YAML_PATH", "")
+    # server_id may be one UUID (single server) or a comma list in the same order as the IPs
+    sids = [x.strip() for x in str(base.get("SERVER_ID") or "").split(",") if x.strip()]
+    if sids:
+        if len(sids) == count:
+            cfg["SERVER_ID"] = sids[index]
+        elif len(sids) == 1 and count == 1:
+            cfg["SERVER_ID"] = sids[0]
+        else:
+            raise AgentError("server_id lists %d id(s) for %d management IP(s); give one per IP, "
+                             "in the same order, or leave it empty" % (len(sids), count))
+    else:
+        cfg["SERVER_ID"] = saved_sid
     return cfg
 
 
@@ -418,10 +480,10 @@ class EventLog:
 
 
 class State:
-    """state.json: the allocation that is in flight (if any)."""
+    """servers/<ip>/state.json: the allocation that is in flight on that server (if any)."""
 
-    def __init__(self) -> None:
-        self.path = os.path.join(HOME_DIR, "state.json")
+    def __init__(self, ip: str) -> None:
+        self.path = os.path.join(server_dir(ip), "state.json")
         self.data: Dict[str, Any] = {"pending": None, "runs": 0}
         if os.path.isfile(self.path):
             with open(self.path, encoding="utf-8") as fh:
@@ -435,7 +497,7 @@ class State:
         return self.data.get("pending")
 
 
-RESULT_FIELDS = ["finished_at", "run_id", "round", "ip", "port_id", "verdict",
+RESULT_FIELDS = ["finished_at", "server", "run_id", "round", "ip", "port_id", "verdict",
                  "reachable_cycles", "blocked_cycles", "down_cycles", "inconclusive_cycles",
                  "best_ok_ratio", "egress_ok", "from_mac_tcp", "seen_before",
                  "released", "error", "links"]
@@ -470,21 +532,42 @@ def load_results() -> List[Dict[str, Any]]:
 # =============================================================================
 # Secrets: the ArvanCloud API key
 # =============================================================================
-def load_api_key(key_file: str = "") -> Tuple[Optional[str], str]:
-    """$ARVAN_API_KEY -> api_key_file / <HOME>/api_key (chmod 600) -> macOS Keychain."""
-    def strip(v: str) -> str:
-        v = v.strip()
-        return v[7:].strip() if v.lower().startswith("apikey ") else v
+def _looks_like_path(v: str) -> bool:
+    return v.startswith(("~", ".", "/")) or "\\" in v or "/" in v or bool(re.match(r"^[A-Za-z]:", v)) \
+        or v.lower().endswith((".txt", ".key", ".pub", ".pem"))
 
+
+def _clean_api_key(v: str, src: str) -> str:
+    v = v.strip()
+    if v.lower().startswith("apikey "):
+        v = v[7:].strip()
+    if not v or not re.fullmatch(r"[\x21-\x7e]+", v):
+        raise AgentError("the ArvanCloud API key from %s is empty or contains spaces/odd characters" % src)
+    return v
+
+
+def load_api_key(value: str = "") -> Tuple[Optional[str], str]:
+    """api_key from the YAML (the key itself or a file path) -> $ARVAN_API_KEY
+    -> <HOME>/api_key -> macOS Keychain."""
+    value = (value or "").strip()
+    if value:
+        p = os.path.expanduser(value)
+        if os.path.isfile(p) or _looks_like_path(value):
+            if not os.path.isfile(p):
+                raise AgentError("api_key looks like a file path but %s does not exist" % p)
+            if not IS_WINDOWS and os.stat(p).st_mode & 0o077:
+                raise AgentError("refusing %s: permissions are too open (chmod 600)" % p)
+            with open(p, encoding="utf-8") as fh:
+                return _clean_api_key(fh.read(), p), "file:%s" % p
+        return _clean_api_key(value, "the YAML file"), "yaml (value)"
     v = os.environ.get("ARVAN_API_KEY", "").strip()
     if v:
-        return strip(v), "env:$ARVAN_API_KEY"
-    p = os.path.expanduser(key_file) if key_file else os.path.join(HOME_DIR, "api_key")
-    if key_file and not os.path.isfile(p):
-        raise AgentError("api_key_file %s not found" % p)
+        return _clean_api_key(v, "$ARVAN_API_KEY"), "env:$ARVAN_API_KEY"
+    strip = lambda x: _clean_api_key(x, "file")  # noqa: E731
+    p = os.path.join(HOME_DIR, "api_key")
     if os.path.isfile(p):
         mode = os.stat(p).st_mode
-        if mode & 0o077:
+        if not IS_WINDOWS and mode & 0o077:
             raise AgentError("refusing %s: permissions %o are too open (chmod 600)" % (p, mode & 0o777))
         with open(p, encoding="utf-8") as fh:
             v = fh.read().strip()
@@ -497,6 +580,9 @@ def load_api_key(key_file: str = "") -> Tuple[Optional[str], str]:
                                capture_output=True, text=True, timeout=20)
             if r.returncode == 0 and r.stdout.strip():
                 return strip(r.stdout), "keychain:%s" % KEYCHAIN_SERVICE
+    if IS_WINDOWS:
+        return None, ("missing: in PowerShell run  $env:ARVAN_API_KEY = Read-Host -MaskInput 'API key'  "
+                      "or set api_key in the YAML file (the key itself or a file path)")
     return None, ("missing: set $ARVAN_API_KEY, write %s (chmod 600), or store it in the "
                   "macOS Keychain (see README)" % p)
 
@@ -790,12 +876,12 @@ def classify_node_result(ctype: str, value: Any) -> Tuple[str, str]:
 
 
 class CheckHost:
+    last_submit = 0.0          # shared by all servers in one run (check-host rate limit)
     PREFERRED_CONTROL_COUNTRIES = ("de", "nl", "fi", "fr", "se", "gb", "pl", "ch", "at", "cz")
 
     def __init__(self, cfg: Dict[str, Any], http: Http, log: EventLog):
         self.cfg, self.http, self.log = cfg, http, log
         self.base = cfg["CHECKHOST_BASE"].rstrip("/")
-        self.last_submit = 0.0
         self._nodes: Optional[Dict[str, Any]] = None
 
     def nodes(self) -> Dict[str, Any]:
@@ -837,13 +923,13 @@ class CheckHost:
         return list(self.cfg["CONTROL_NODES_FALLBACK"])
 
     def submit(self, ctype: str, host: str, nodes: List[str]) -> Tuple[str, Dict[str, Any], str]:
-        wait = self.last_submit + float(self.cfg["CHECKHOST_MIN_SPACING_SEC"]) - time.time()
+        wait = CheckHost.last_submit + float(self.cfg["CHECKHOST_MIN_SPACING_SEC"]) - time.time()
         if wait > 0:
             self.log.debug("checkhost_pacing", sleep_sec=int(wait))
             time.sleep(wait)
         q = [("host", host)] + [("node", n) for n in nodes]
         url = "%s/check-%s?%s" % (self.base, ctype, urllib.parse.urlencode(q))
-        self.last_submit = time.time()
+        CheckHost.last_submit = time.time()
         resp = self.http.request("GET", url, retries=0)
         j = resp.json
         if resp.status == 429 or (isinstance(j, dict) and j.get("error") == "limit_exceeded"):
@@ -976,6 +1062,7 @@ class Ssh:
     def __init__(self, cfg: Dict[str, Any], log: EventLog):
         self.cfg, self.log = cfg, log
         self.host = cfg["MANAGEMENT_IP"]
+        self.identity, self.pub_id, self.key_kind = resolve_ssh_identity(cfg)
 
     def base_cmd(self, multiplex: bool = True) -> List[str]:
         c = self.cfg
@@ -984,14 +1071,13 @@ class Ssh:
                "-o", "ConnectTimeout=%d" % int(c["SSH_CONNECT_TIMEOUT"]),
                "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
                "-o", "StrictHostKeyChecking=accept-new"]
-        if multiplex:
+        if multiplex and not IS_WINDOWS:     # Windows OpenSSH has no ControlMaster support
             cmd += ["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/abip-%C",
                     "-o", "ControlPersist=120"]
-        else:
+        elif not IS_WINDOWS:
             cmd += ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
-        if c.get("SSH_PUBKEY"):
-            cmd += ["-o", "IdentityFile=%s" % os.path.expanduser(c["SSH_PUBKEY"]),
-                    "-o", "IdentitiesOnly=yes"]
+        if self.identity:
+            cmd += ["-o", "IdentityFile=%s" % self.identity, "-o", "IdentitiesOnly=yes"]
         cmd += list(c.get("SSH_EXTRA_OPTS") or [])
         cmd += ["%s@%s" % (c["SSH_USER"], self.host)]
         return cmd
@@ -1001,7 +1087,8 @@ class Ssh:
         cmd = self.base_cmd(multiplex) + ["--", remote]
         self.log.debug("ssh", remote=remote)
         try:
-            p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout)
+            p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout,
+                               encoding="utf-8", errors="replace")
         except subprocess.TimeoutExpired:
             raise SshError("ssh %s@%s timed out after %ss running: %s"
                            % (self.cfg["SSH_USER"], self.host, timeout, remote))
@@ -1015,7 +1102,7 @@ class Ssh:
 
     def sudo_sh(self, script: str, check: bool = True, timeout: float = 60) -> subprocess.CompletedProcess:
         """Run a POSIX sh script as root (script sent on stdin, so no quoting issues)."""
-        sudo = (self.cfg.get("SUDO") or "").strip()
+        sudo = self.sudo_prefix()
         return self.run(("%s sh -s" % sudo).strip(), stdin="set -e\n" + script, check=check,
                         timeout=timeout)
 
@@ -1026,7 +1113,14 @@ class Ssh:
         except ValueError:
             return []
 
+    def sudo_prefix(self) -> str:
+        if str(self.cfg.get("SSH_USER")) == "root":
+            return ""                          # already root: no sudo needed
+        return (self.cfg.get("SUDO") or "").strip()
+
     def close_master(self) -> None:
+        if IS_WINDOWS:
+            return
         with contextlib.suppress(Exception):
             subprocess.run(self.base_cmd() + ["-O", "exit"], capture_output=True, timeout=10)
 
@@ -1066,17 +1160,71 @@ class Ssh:
         return max(seen, key=lambda k: seen[k]) if seen else None
 
 
+PUBKEY_PREFIXES = ("ssh-", "ecdsa-sha2-", "sk-ssh-", "sk-ecdsa-")
+
+
+def _write_private(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    os.chmod(path, 0o600)
+    if IS_WINDOWS:   # Windows OpenSSH refuses private keys other users can read
+        user = os.environ.get("USERNAME") or getpass.getuser()
+        subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", "%s:F" % user],
+                       capture_output=True, text=True)
+
+
+def resolve_ssh_identity(cfg: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], str]:
+    """(IdentityFile path or None, "<type> <base64>" of the public key or None, kind).
+    kind: none | agent-pub (agent must hold it) | private (ssh reads the file)."""
+    v = str(cfg.get("SSH_KEY") or cfg.get("SSH_PUBKEY") or "").strip()
+    if not v:
+        return None, None, "none"
+    import hashlib
+    tag = hashlib.sha256(v.encode("utf-8")).hexdigest()[:10]
+    kdir = os.path.join(HOME_DIR, "keys")
+    if v.startswith(PUBKEY_PREFIXES) and len(v.split()) >= 2:          # public key text
+        path = os.path.join(kdir, "inline-%s.pub" % tag)
+        os.makedirs(kdir, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(v + "\n")
+        return path, " ".join(v.split()[:2]), "agent-pub"
+    if "PRIVATE KEY" in v:                                             # private key text
+        text = v.replace("\\n", "\n").strip() + "\n"
+        if not text.startswith("-----BEGIN"):
+            raise AgentError("ssh_key looks like a private key but does not start with -----BEGIN")
+        path = os.path.join(kdir, "inline-%s" % tag)
+        _write_private(path, text)
+        return path, None, "private"
+    path = os.path.expanduser(v)                                       # a file path
+    if not os.path.isfile(path):
+        raise AgentError("ssh_key %s: no such file (give a key file path, a public key line "
+                         "'ssh-ed25519 AAAA...', or a private key)" % path)
+    if path.endswith(".pub"):
+        return path, pubkey_id(path), "agent-pub"
+    return path, pubkey_id(path + ".pub") if os.path.isfile(path + ".pub") else None, "private"
+
+
 def agent_keys() -> Tuple[bool, List[str], str]:
     """(ok, ["<type> <base64>"...], message) from the local ssh-agent."""
-    if not os.environ.get("SSH_AUTH_SOCK"):
-        return False, [], "SSH_AUTH_SOCK is not set: no ssh-agent in this shell"
+    if IS_WINDOWS:
+        hint = ("start the agent and load the key in an ADMIN PowerShell:  "
+                "Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent; "
+                "then (normal PowerShell):  ssh-add $HOME\\.ssh\\id_ed25519")
+    else:
+        hint = "ssh-add --apple-use-keychain ~/.ssh/id_ed25519" if sys.platform == "darwin" \
+            else "ssh-add ~/.ssh/id_ed25519"
+        if not os.environ.get("SSH_AUTH_SOCK"):
+            return False, [], "SSH_AUTH_SOCK is not set: no ssh-agent in this shell (%s)" % hint
     try:
-        p = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True, timeout=10)
+        p = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True, timeout=10,
+                           encoding="utf-8", errors="replace")
     except (OSError, subprocess.SubprocessError) as exc:
         return False, [], "ssh-add failed: %s" % exc
     if p.returncode != 0:
-        return False, [], "ssh-agent has no keys (%s). On macOS: ssh-add --apple-use-keychain ~/.ssh/id_ed25519" \
-            % (p.stdout or p.stderr).strip()
+        return False, [], "ssh-agent has no keys or is not running (%s). Fix: %s" \
+            % ((p.stdout or p.stderr).strip()[:150], hint)
     keys = [" ".join(l.split()[:2]) for l in p.stdout.splitlines() if l.strip()]
     return True, keys, "%d key(s) in agent" % len(keys)
 
@@ -1146,7 +1294,7 @@ class Agent:
                  need_key: bool = True):
         self.cfg, self.log, self.dry_run = cfg, log, dry_run
         self.http = Http(cfg, log, read_only=dry_run)
-        key, src = load_api_key(cfg.get("API_KEY_FILE") or "")
+        key, src = load_api_key(cfg.get("API_KEY") or cfg.get("API_KEY_FILE") or "")
         if need_key and not key:
             raise AgentError("ArvanCloud API key " + src)
         self.key_source = src
@@ -1154,7 +1302,7 @@ class Agent:
         self.ssh = Ssh(cfg, log)
         self.ch = CheckHost(cfg, self.http, log)
         self.reach = Reachability(cfg, self.ch, log)
-        self.state = State()
+        self.state = State(cfg["MANAGEMENT_IP"])
 
     # ---------------------------------------------------------------- helpers --
     @staticmethod
@@ -1171,8 +1319,8 @@ class Agent:
     def _require_init(self) -> None:
         missing = [k for k in ("MANAGEMENT_IP", "SERVER_ID", "MANAGEMENT_PORT_ID") if not self.cfg.get(k)]
         if missing:
-            raise AgentError("not initialised (%s missing): run `%s init --management-ip X.X.X.X`"
-                             % (", ".join(missing), PROJECT))
+            raise AgentError("server %s is not initialised (%s missing): run `%s init`"
+                             % (self.cfg.get("MANAGEMENT_IP"), ", ".join(missing), PROJECT))
 
     def _protected(self) -> Tuple[set, set]:
         return ({self.cfg["MANAGEMENT_PORT_ID"]}, {self.cfg["MANAGEMENT_IP"]})
@@ -1226,15 +1374,9 @@ class Agent:
                  cfg["MANAGEMENT_GATEWAY"] or "?", cfg["SSH_USER"], mgmt_ip))
         keep = {k: cfg[k] for k in ("REGION", "SERVER_ID", "SERVER_NAME", "MANAGEMENT_IP",
                                     "MANAGEMENT_PORT_ID", "MANAGEMENT_IFACE", "MANAGEMENT_GATEWAY",
-                                    "MANAGEMENT_CIDR", "PROTECT_MGMT_ROUTE", "SSH_USER", "SSH_PORT",
-                                    "SSH_PUBKEY")}
-        old = {}
-        if os.path.isfile(config_path()):
-            with open(config_path(), encoding="utf-8") as fh:
-                old = json.load(fh)
-        old.update(keep)
-        _write_json_atomic(config_path(), old)
-        print("saved    : %s" % config_path())
+                                    "MANAGEMENT_CIDR", "PROTECT_MGMT_ROUTE")}
+        _write_json_atomic(config_path(mgmt_ip), keep)
+        print("saved    : %s" % config_path(mgmt_ip))
         return 0
 
     # -------------------------------------------------------------- preflight --
@@ -1268,11 +1410,15 @@ class Agent:
         except AgentError as exc:
             row(False, "arvan api", str(exc))
         ok, keys, msg = agent_keys()
-        row(ok, "ssh-agent", msg)
-        if ok and cfg.get("SSH_PUBKEY"):
-            pid = pubkey_id(cfg["SSH_PUBKEY"])
-            row(bool(pid and pid in keys), "agent has SSH_PUBKEY",
-                cfg["SSH_PUBKEY"] + ("" if pid else " (cannot read file)"))
+        if self.ssh.key_kind == "private":
+            row(True, "ssh key", "private key file %s" % self.ssh.identity)
+            row(True if ok else None, "ssh-agent", msg + " (optional with a private key file)")
+        else:
+            row(ok, "ssh-agent", msg)
+            if ok and self.ssh.key_kind == "agent-pub":
+                row(bool(self.ssh.pub_id and self.ssh.pub_id in keys), "agent has ssh_key",
+                    "%s %s" % ((self.ssh.pub_id or "?")[:40] + "...", "" if self.ssh.pub_id else
+                                "(cannot read the public key)"))
         try:
             self.ssh.run("true", multiplex=False)
             row(True, "ssh", "%s@%s:%s" % (cfg["SSH_USER"], cfg["MANAGEMENT_IP"], cfg["SSH_PORT"]))
@@ -1315,7 +1461,7 @@ class Agent:
         self.ssh.sudo_sh(self._mgmt_vars() + MGMT_PROTECT_SH)
         # confirm with a FRESH connection (not the multiplexed one), else the watchdog undoes it
         try:
-            self.ssh.run("%s touch /run/arvin-agent-badip.mgmt-ok" % self.cfg["SUDO"], multiplex=False,
+            self.ssh.run(("%s touch /run/arvin-agent-badip.mgmt-ok" % self.ssh.sudo_prefix()).strip(), multiplex=False,
                          timeout=30)
         except SshError as exc:
             raise AbortRun("management SSH failed after pinning the management route (%s); the VM "
@@ -1368,7 +1514,7 @@ class Agent:
     # ------------------------------------------------------------------ round --
     def one_round(self, run_id: str, n: int, seen: set) -> Dict[str, Any]:
         cfg = self.cfg
-        rec: Dict[str, Any] = {"run_id": run_id, "round": n, "started_at": iso(), "ip": None,
+        rec: Dict[str, Any] = {"server": cfg["MANAGEMENT_IP"], "run_id": run_id, "round": n, "started_at": iso(), "ip": None,
                                "port_id": None, "verdict": "ERROR", "cycles": [], "links": [],
                                "released": None, "error": None}
         inv = self.api.public_inventory()
@@ -1535,7 +1681,7 @@ class Agent:
         if self.cfg["BASELINE_CHECK"]:
             with contextlib.suppress(InconclusiveError):
                 b = self.reach.cycle(self.cfg["MANAGEMENT_IP"], "baseline-mgmt")
-                append_result({"run_id": run_id, "round": 0, "ip": self.cfg["MANAGEMENT_IP"],
+                append_result({"server": self.cfg["MANAGEMENT_IP"], "run_id": run_id, "round": 0, "ip": self.cfg["MANAGEMENT_IP"],
                                "port_id": self.cfg["MANAGEMENT_PORT_ID"], "finished_at": iso(),
                                "verdict": "MGMT-" + aggregate_verdict([b["verdict"]]),
                                "links": [b.get("link")] if b.get("link") else [], "released": "n/a"})
@@ -1616,7 +1762,7 @@ class Agent:
             self.state.save()
         print("releasing %s (port %s) ..." % (pend["ip"], pend["port_id"]))
         if self.release(pend):
-            append_result({"run_id": pend.get("run_id"), "round": pend.get("round"), "ip": pend["ip"],
+            append_result({"server": self.cfg["MANAGEMENT_IP"], "run_id": pend.get("run_id"), "round": pend.get("round"), "ip": pend["ip"],
                            "port_id": pend["port_id"], "finished_at": iso(), "verdict": "ERROR",
                            "released": True, "error": "released by cleanup"})
             self.state.data["pending"] = None
@@ -1631,11 +1777,11 @@ class Agent:
 def summary_table(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "(no results)"
-    lines = ["%-20s %-5s %-16s %-12s %-5s %-6s %-8s %s" % ("finished", "round", "ip", "verdict",
-                                                          "r/b/d", "egress", "released", "first link")]
+    lines = ["%-20s %-16s %-5s %-16s %-12s %-5s %-6s %-8s %s" % (
+        "finished", "server", "round", "ip", "verdict", "r/b/d", "egress", "released", "first link")]
     for r in rows:
-        lines.append("%-20s %-5s %-16s %-12s %-5s %-6s %-8s %s" % (
-            r.get("finished_at") or "", r.get("round"), r.get("ip") or "-", r.get("verdict"),
+        lines.append("%-20s %-16s %-5s %-16s %-12s %-5s %-6s %-8s %s" % (
+            r.get("finished_at") or "", r.get("server") or "-", r.get("round"), r.get("ip") or "-", r.get("verdict"),
             "%s/%s/%s" % (r.get("reachable_cycles", "-"), r.get("blocked_cycles", "-"), r.get("down_cycles", "-")),
             {True: "ok", False: "BAD", None: "-"}.get(r.get("egress_ok"), "-"),
             r.get("released"), (r.get("links") or [""])[0]))
@@ -1648,10 +1794,18 @@ def summary_table(rows: List[Dict[str, Any]]) -> str:
 # CLI
 # =============================================================================
 EPILOG = """\
+typical first use on Windows (PowerShell):
+  ssh-add $HOME/.ssh/id_ed25519                # ssh-agent service must be running
+  $env:ARVAN_API_KEY = Read-Host -MaskInput "API key"
+  python arvin_agent_badip.py init             # reads arvin-agent-badip.yaml
+  python arvin_agent_badip.py preflight
+  python arvin_agent_badip.py test --dry-run
+  python arvin_agent_badip.py test --rounds 1 --yes
+
 typical first use (on your Mac):
   ssh-add --apple-use-keychain ~/.ssh/id_ed25519
   security add-generic-password -U -a "$USER" -s %(p)s -w      # paste the API key
-  ./arvin_agent_badip.py init --management-ip 185.x.x.x --ssh-pubkey ~/.ssh/id_ed25519.pub
+  ./arvin_agent_badip.py init        # reads management_ip (one or "ip1, ip2") from the YAML
   ./arvin_agent_badip.py preflight
   ./arvin_agent_badip.py test --dry-run
   ./arvin_agent_badip.py test --rounds 1 --yes        # one billable round first
@@ -1668,15 +1822,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--version", action="version", version=__version__)
     ap.add_argument("--region")
     ap.add_argument("--ssh-user")
-    ap.add_argument("--ssh-pubkey", help="public key (.pub) of the ssh-agent key to use")
+    ap.add_argument("--ssh-key", "--ssh-pubkey", dest="ssh_key",
+                    help="SSH key: a file path or the key itself (public key line or private key)")
+    ap.add_argument("--server", help="only these management IP(s) from the YAML file (comma list)")
     ap.add_argument("--ssh-port", type=int)
     ap.add_argument("-c", "--config", help="YAML inputs file (default: ./arvin-agent-badip.yaml, "
                                            "then ~/arvin-agent-badip/config.yaml)")
     ap.add_argument("-v", "--verbose", action="store_true")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("init", help="save the management IP and find the server")
-    p.add_argument("--management-ip", help="default: management_ip from the YAML file")
-    p.add_argument("--server-id")
+    p.add_argument("--management-ip", help="default: management_ip from the YAML file (comma list ok)")
+    p.add_argument("--server-id", help="only with a single management IP")
     sub.add_parser("preflight", help="read-only checks: API key, server, SSH, sudo, check-host")
     p = sub.add_parser("test", help="allocate, test and release test IPs (billable)")
     p.add_argument("--rounds", type=int)
@@ -1694,68 +1850,112 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--last", type=int, default=0)
     sub.add_parser("status", help="show config and anything pending")
     a = ap.parse_args(argv)
+    a.server_id_check = bool(getattr(a, "server_id", None))
+    for name in ("server_id", "management_ip", "rounds", "checks_per_ip", "check_type", "check_port",
+                 "no_baseline", "dry_run", "yes", "bad", "good", "last"):
+        if not hasattr(a, name):
+            setattr(a, name, None)
+    if not a.cmd:
+        ap.print_help()
+        print("\nno command given. Start with:\n  python arvin_agent_badip.py init\n"
+              "  python arvin_agent_badip.py preflight")
+        return 1
 
-    ov: Dict[str, Any] = {"REGION": a.region, "SSH_USER": a.ssh_user, "SSH_PUBKEY": a.ssh_pubkey,
+    ov: Dict[str, Any] = {"REGION": a.region, "SSH_USER": a.ssh_user, "SSH_KEY": a.ssh_key,
                           "SSH_PORT": a.ssh_port, "LOG_LEVEL": "debug" if a.verbose else None}
     if a.cmd == "test":
         ov.update(ROUNDS=a.rounds, CHECKS_PER_IP=a.checks_per_ip, CHECK_TYPE=a.check_type,
                   CHECK_PORT=a.check_port, BASELINE_CHECK=False if a.no_baseline else None)
     if a.cmd == "init":
         ov["SERVER_ID"] = a.server_id
+        ov["MANAGEMENT_IP"] = a.management_ip
     try:
-        cfg = load_config(ov, a.config, for_init=(a.cmd == "init"))
-        log = EventLog(cfg, quiet=a.cmd in ("results", "status"))
+        base = load_config(ov, a.config)
+        log = EventLog(base, quiet=a.cmd in ("results", "status"))
         if a.cmd == "results":
             rows = load_results()
             if a.bad:
                 rows = [r for r in rows if r.get("verdict") == "BAD"]
             if a.good:
                 rows = [r for r in rows if r.get("verdict") == "GOOD"]
+            if a.server:
+                rows = [r for r in rows if r.get("server") in parse_ip_list(a.server)]
             if a.last:
                 rows = rows[-a.last:]
             print(summary_table(rows))
             return 0
+        ips = parse_ip_list(base.get("MANAGEMENT_IP"))
+        if a.server:
+            only = parse_ip_list(a.server)
+            unknown = [x for x in only if x not in ips]
+            if unknown:
+                raise AgentError("--server %s is not in management_ip (%s)"
+                                 % (", ".join(unknown), ", ".join(ips) or "empty"))
+            sel = only
+        else:
+            sel = ips
+        if not sel:
+            raise AgentError("no management IP: set management_ip in the YAML file "
+                             "(one IP, or several separated by commas) or use --management-ip")
+        if a.server_id_check and len(ips) > 1:
+            raise AgentError("--server-id only works with one management IP; with several, put a "
+                             "comma list in server_id (same order) or leave it empty")
+        cfgs = [server_config(base, ip, ips.index(ip), len(ips)) for ip in sel]
         if a.cmd == "status":
-            st = State()
-            print(json.dumps(redact({k: cfg[k] for k in ("REGION", "SERVER_ID", "SERVER_NAME", "MANAGEMENT_IP",
-                                                         "MANAGEMENT_PORT_ID", "MANAGEMENT_IFACE",
-                                                         "MANAGEMENT_GATEWAY", "SSH_USER", "SSH_PUBKEY",
-                                                         "ROUNDS", "CHECKS_PER_IP", "CHECK_TYPE", "CHECK_PORT")}),
-                             indent=2))
-            print("inputs :", cfg.get("_YAML_PATH") or "(no YAML file found)")
+            print("inputs :", base.get("_YAML_PATH") or "(no YAML file found)")
             print("home   :", HOME_DIR)
-            print("pending:", json.dumps(st.pending) if st.pending else "none")
+            for c in cfgs:
+                st = State(c["MANAGEMENT_IP"])
+                print("\n== %s ==" % c["MANAGEMENT_IP"])
+                print(json.dumps(redact({k: c[k] for k in (
+                    "REGION", "SERVER_ID", "SERVER_NAME", "MANAGEMENT_PORT_ID", "MANAGEMENT_IFACE",
+                    "MANAGEMENT_GATEWAY", "SSH_USER", "ROUNDS", "CHECKS_PER_IP", "CHECK_TYPE",
+                    "CHECK_PORT")}), indent=2))
+                print("pending:", json.dumps(st.pending) if st.pending else "none")
             return 0
-        agent = Agent(cfg, log, dry_run=(a.cmd == "test" and a.dry_run))
-        if a.cmd == "init":
-            mip = a.management_ip or cfg.get("MANAGEMENT_IP")
-            if not mip:
-                raise AgentError("give --management-ip or set management_ip in the YAML file")
-            return agent.init(mip)
-        if a.cmd == "preflight":
-            return agent.preflight()
-        if a.cmd == "cleanup":
-            if not a.yes:
-                print("cleanup changes the server: re-run with --yes")
+        if a.cmd == "cleanup" and not a.yes:
+            print("cleanup changes the server(s): re-run with --yes")
+            return 1
+        if a.cmd == "test" and not a.dry_run and not a.yes:
+            rounds = sum(int(c["ROUNDS"]) for c in cfgs)
+            ans = input("This allocates and releases %d billable public IPv4(s) on %d server(s) (%s). "
+                        "Continue? [y/N] " % (rounds, len(cfgs), ", ".join(sel)))
+            if ans.strip().lower() not in ("y", "yes"):
                 return 1
-            return agent.cleanup()
-        if a.cmd == "test":
-            rounds = int(cfg["ROUNDS"])
-            if a.dry_run:
-                return agent.dry_run_report(rounds)
-            if not a.yes:
-                ans = input("This allocates and releases %d billable public IPv4(s) on %s. Continue? [y/N] "
-                            % (rounds, cfg.get("SERVER_NAME") or cfg.get("SERVER_ID")))
-                if ans.strip().lower() not in ("y", "yes"):
-                    return 1
-            return agent.test(rounds)
+        rc = 0
+        for c in cfgs:
+            if len(cfgs) > 1:
+                print("\n################ server %s ################" % c["MANAGEMENT_IP"])
+            try:
+                agent = Agent(c, log, dry_run=(a.cmd == "test" and a.dry_run))
+                if a.cmd == "init":
+                    r = agent.init(c["MANAGEMENT_IP"])
+                elif a.cmd == "preflight":
+                    r = agent.preflight()
+                elif a.cmd == "cleanup":
+                    r = agent.cleanup()
+                elif a.dry_run:
+                    r = agent.dry_run_report(int(c["ROUNDS"]))
+                else:
+                    r = agent.test(int(c["ROUNDS"]))
+                    if r == 4 or State(c["MANAGEMENT_IP"]).pending:
+                        rc = max(rc, r or 2)
+                        print("stopping: not continuing with the other servers")
+                        break
+            except AgentError as exc:
+                print("error [%s]: %s" % (c["MANAGEMENT_IP"], exc), file=sys.stderr)
+                r = 1
+            rc = max(rc, r)
+        return rc
     except AgentError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 4
-    return 1
 
 
 if __name__ == "__main__":
+    for _stream in (sys.stdout, sys.stderr):     # Windows consoles may not be UTF-8
+        with contextlib.suppress(AttributeError, ValueError):
+            _stream.reconfigure(errors="replace")
     sys.exit(main())
