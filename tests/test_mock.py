@@ -119,3 +119,23 @@ assert m.main(["--config", y, "test", "--yes"]) == 0 and len(cloud.detached) == 
 open(y, "w").write("management_ip: 185.9.9.9\n")
 assert m.main(["--config", y, "status"]) == 1     # differs from init -> must re-run init
 print("YAML OK")
+
+# ---- Windows behaviour -----------------------------------------------------
+m.IS_WINDOWS = True
+open(y, "w").write("ssh_user: root\n"); cfgw = m.load_config({}, y)
+ssh = m.Ssh(cfgw, m.EventLog(cfgw, quiet=True))
+cmd = " ".join(ssh.base_cmd())
+assert "ControlMaster" not in cmd and "ControlPath" not in cmd, cmd
+assert ssh.sudo_prefix() == ""
+for bad in ("apikey 11111111-2222-3333-4444-555555555555", "11111111-2222-3333-4444-555555555555"):
+    try:
+        m.load_api_key(bad); raise SystemExit("accepted key as path")
+    except m.AgentError as e:
+        assert "1111" not in str(e); print("rejected key-as-path:", str(e)[:60])
+kf = os.path.join(home, "k.txt"); open(kf, "w").write("Apikey abc\n"); os.chmod(kf, 0o644)
+saved = os.environ.pop("ARVAN_API_KEY")
+assert m.load_api_key(kf)[0] == "abc"          # no chmod check on Windows
+os.environ["ARVAN_API_KEY"] = saved
+m.IS_WINDOWS = False
+assert m.main([]) == 1
+print("WINDOWS OK")

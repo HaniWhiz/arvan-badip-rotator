@@ -149,6 +149,7 @@ DEFAULTS: Dict[str, Any] = {
     "LOG_LEVEL": "info",
 }
 
+IS_WINDOWS = os.name == "nt"
 HOME_DIR = os.path.expanduser(os.environ.get("ABIP_HOME", "~/" + PROJECT))
 KEYCHAIN_SERVICE = PROJECT
 
@@ -476,6 +477,11 @@ def load_api_key(key_file: str = "") -> Tuple[Optional[str], str]:
         v = v.strip()
         return v[7:].strip() if v.lower().startswith("apikey ") else v
 
+    if key_file and (key_file.lower().startswith("apikey ")
+                     or re.fullmatch(r"[0-9a-fA-F-]{32,40}", key_file.strip())):
+        raise AgentError("api_key_file must be the PATH of a file that holds the key, but it looks "
+                         "like the key itself. Remove it from the YAML file (and revoke that key if "
+                         "the file was shared), then use $ARVAN_API_KEY or a key file")
     v = os.environ.get("ARVAN_API_KEY", "").strip()
     if v:
         return strip(v), "env:$ARVAN_API_KEY"
@@ -484,7 +490,7 @@ def load_api_key(key_file: str = "") -> Tuple[Optional[str], str]:
         raise AgentError("api_key_file %s not found" % p)
     if os.path.isfile(p):
         mode = os.stat(p).st_mode
-        if mode & 0o077:
+        if not IS_WINDOWS and mode & 0o077:
             raise AgentError("refusing %s: permissions %o are too open (chmod 600)" % (p, mode & 0o777))
         with open(p, encoding="utf-8") as fh:
             v = fh.read().strip()
@@ -497,6 +503,9 @@ def load_api_key(key_file: str = "") -> Tuple[Optional[str], str]:
                                capture_output=True, text=True, timeout=20)
             if r.returncode == 0 and r.stdout.strip():
                 return strip(r.stdout), "keychain:%s" % KEYCHAIN_SERVICE
+    if IS_WINDOWS:
+        return None, ("missing: in PowerShell run  $env:ARVAN_API_KEY = Read-Host -MaskInput 'API key'  "
+                      "or put the key in %s (or the file named by api_key_file)" % p)
     return None, ("missing: set $ARVAN_API_KEY, write %s (chmod 600), or store it in the "
                   "macOS Keychain (see README)" % p)
 
@@ -984,10 +993,10 @@ class Ssh:
                "-o", "ConnectTimeout=%d" % int(c["SSH_CONNECT_TIMEOUT"]),
                "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
                "-o", "StrictHostKeyChecking=accept-new"]
-        if multiplex:
+        if multiplex and not IS_WINDOWS:     # Windows OpenSSH has no ControlMaster support
             cmd += ["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/abip-%C",
                     "-o", "ControlPersist=120"]
-        else:
+        elif not IS_WINDOWS:
             cmd += ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
         if c.get("SSH_PUBKEY"):
             cmd += ["-o", "IdentityFile=%s" % os.path.expanduser(c["SSH_PUBKEY"]),
@@ -1001,7 +1010,8 @@ class Ssh:
         cmd = self.base_cmd(multiplex) + ["--", remote]
         self.log.debug("ssh", remote=remote)
         try:
-            p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout)
+            p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout,
+                               encoding="utf-8", errors="replace")
         except subprocess.TimeoutExpired:
             raise SshError("ssh %s@%s timed out after %ss running: %s"
                            % (self.cfg["SSH_USER"], self.host, timeout, remote))
@@ -1015,7 +1025,7 @@ class Ssh:
 
     def sudo_sh(self, script: str, check: bool = True, timeout: float = 60) -> subprocess.CompletedProcess:
         """Run a POSIX sh script as root (script sent on stdin, so no quoting issues)."""
-        sudo = (self.cfg.get("SUDO") or "").strip()
+        sudo = self.sudo_prefix()
         return self.run(("%s sh -s" % sudo).strip(), stdin="set -e\n" + script, check=check,
                         timeout=timeout)
 
@@ -1026,7 +1036,14 @@ class Ssh:
         except ValueError:
             return []
 
+    def sudo_prefix(self) -> str:
+        if str(self.cfg.get("SSH_USER")) == "root":
+            return ""                          # already root: no sudo needed
+        return (self.cfg.get("SUDO") or "").strip()
+
     def close_master(self) -> None:
+        if IS_WINDOWS:
+            return
         with contextlib.suppress(Exception):
             subprocess.run(self.base_cmd() + ["-O", "exit"], capture_output=True, timeout=10)
 
@@ -1068,15 +1085,23 @@ class Ssh:
 
 def agent_keys() -> Tuple[bool, List[str], str]:
     """(ok, ["<type> <base64>"...], message) from the local ssh-agent."""
-    if not os.environ.get("SSH_AUTH_SOCK"):
-        return False, [], "SSH_AUTH_SOCK is not set: no ssh-agent in this shell"
+    if IS_WINDOWS:
+        hint = ("start the agent and load the key in an ADMIN PowerShell:  "
+                "Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent; "
+                "then (normal PowerShell):  ssh-add $HOME\\.ssh\\id_ed25519")
+    else:
+        hint = "ssh-add --apple-use-keychain ~/.ssh/id_ed25519" if sys.platform == "darwin" \
+            else "ssh-add ~/.ssh/id_ed25519"
+        if not os.environ.get("SSH_AUTH_SOCK"):
+            return False, [], "SSH_AUTH_SOCK is not set: no ssh-agent in this shell (%s)" % hint
     try:
-        p = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True, timeout=10)
+        p = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True, timeout=10,
+                           encoding="utf-8", errors="replace")
     except (OSError, subprocess.SubprocessError) as exc:
         return False, [], "ssh-add failed: %s" % exc
     if p.returncode != 0:
-        return False, [], "ssh-agent has no keys (%s). On macOS: ssh-add --apple-use-keychain ~/.ssh/id_ed25519" \
-            % (p.stdout or p.stderr).strip()
+        return False, [], "ssh-agent has no keys or is not running (%s). Fix: %s" \
+            % ((p.stdout or p.stderr).strip()[:150], hint)
     keys = [" ".join(l.split()[:2]) for l in p.stdout.splitlines() if l.strip()]
     return True, keys, "%d key(s) in agent" % len(keys)
 
@@ -1315,7 +1340,7 @@ class Agent:
         self.ssh.sudo_sh(self._mgmt_vars() + MGMT_PROTECT_SH)
         # confirm with a FRESH connection (not the multiplexed one), else the watchdog undoes it
         try:
-            self.ssh.run("%s touch /run/arvin-agent-badip.mgmt-ok" % self.cfg["SUDO"], multiplex=False,
+            self.ssh.run(("%s touch /run/arvin-agent-badip.mgmt-ok" % self.ssh.sudo_prefix()).strip(), multiplex=False,
                          timeout=30)
         except SshError as exc:
             raise AbortRun("management SSH failed after pinning the management route (%s); the VM "
@@ -1648,6 +1673,14 @@ def summary_table(rows: List[Dict[str, Any]]) -> str:
 # CLI
 # =============================================================================
 EPILOG = """\
+typical first use on Windows (PowerShell):
+  ssh-add $HOME/.ssh/id_ed25519                # ssh-agent service must be running
+  $env:ARVAN_API_KEY = Read-Host -MaskInput "API key"
+  python arvin_agent_badip.py init             # reads arvin-agent-badip.yaml
+  python arvin_agent_badip.py preflight
+  python arvin_agent_badip.py test --dry-run
+  python arvin_agent_badip.py test --rounds 1 --yes
+
 typical first use (on your Mac):
   ssh-add --apple-use-keychain ~/.ssh/id_ed25519
   security add-generic-password -U -a "$USER" -s %(p)s -w      # paste the API key
@@ -1673,7 +1706,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("-c", "--config", help="YAML inputs file (default: ./arvin-agent-badip.yaml, "
                                            "then ~/arvin-agent-badip/config.yaml)")
     ap.add_argument("-v", "--verbose", action="store_true")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("init", help="save the management IP and find the server")
     p.add_argument("--management-ip", help="default: management_ip from the YAML file")
     p.add_argument("--server-id")
@@ -1694,6 +1727,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--last", type=int, default=0)
     sub.add_parser("status", help="show config and anything pending")
     a = ap.parse_args(argv)
+    if not a.cmd:
+        ap.print_help()
+        print("\nno command given. Start with:\n  python arvin_agent_badip.py init\n"
+              "  python arvin_agent_badip.py preflight")
+        return 1
 
     ov: Dict[str, Any] = {"REGION": a.region, "SSH_USER": a.ssh_user, "SSH_PUBKEY": a.ssh_pubkey,
                           "SSH_PORT": a.ssh_port, "LOG_LEVEL": "debug" if a.verbose else None}
@@ -1758,4 +1796,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    for _stream in (sys.stdout, sys.stderr):     # Windows consoles may not be UTF-8
+        with contextlib.suppress(AttributeError, ValueError):
+            _stream.reconfigure(errors="replace")
     sys.exit(main())

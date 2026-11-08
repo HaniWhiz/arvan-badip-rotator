@@ -40,6 +40,28 @@ Before the first round, the management IP's replies are pinned to its own NIC wi
 
 Each run also probes the management IP once and saves it as `MGMT-…` (round 0) for comparison.
 
+## Setup (Windows, PowerShell)
+
+```powershell
+# 1. ssh-agent (once, in an ADMIN PowerShell), then load your key (normal PowerShell)
+Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent
+ssh-add $HOME/.ssh/id_ed25519
+ssh-add -L                                     # must list the key
+
+# 2. API key for this PowerShell window (typed hidden; never put it in the YAML file)
+$env:ARVAN_API_KEY = Read-Host -MaskInput "ArvanCloud API key"
+
+# 3. fill in arvin-agent-badip.yaml next to the script, then:
+python arvin_agent_badip.py init
+python arvin_agent_badip.py preflight
+python arvin_agent_badip.py test --dry-run
+python arvin_agent_badip.py test --rounds 1 --yes
+```
+
+Running the script with no command only prints the help.
+
+On Windows, SSH connection sharing (ControlMaster) is off, because Windows OpenSSH doesn't support it. Every remote step opens its own SSH connection, which makes runs a little slower. If `ssh_user` is `root`, `sudo` is skipped.
+
 ## Setup (macOS)
 
 ```sh

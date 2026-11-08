@@ -6,9 +6,10 @@
 # Precedence: script defaults < values found by `init` < this file < command-line flags.
 # Leave a value empty to keep the default. Keep the file flat (no nesting).
 #
-# The ArvanCloud API key does NOT go in this file. Store it in the macOS Keychain:
-#   security add-generic-password -U -a "$USER" -s arvin-agent-badip -w
-# or set api_key_file below, or export ARVAN_API_KEY.
+# The ArvanCloud API key does NOT go in this file. Give it to the script with:
+#   Windows PowerShell:  $env:ARVAN_API_KEY = Read-Host -MaskInput "API key"
+#   macOS:               security add-generic-password -U -a "$USER" -s arvin-agent-badip -w
+# or put it alone in a file and set api_key_file below to that file's PATH.
 
 # =============================================================================
 # REQUIRED: you must fill these in
@@ -20,7 +21,7 @@ management_ip: ""                 # e.g. 185.x.x.x
 # ArvanCloud region code of the server (shown in the panel / API).
 region: ir-thr-ba1
 
-# SSH access to the VM (user hani + a key loaded in your macOS ssh-agent).
+# SSH access to the VM (a key loaded in your ssh-agent; Windows: the "ssh-agent" service).
 ssh_user: hani
 ssh_pubkey: ~/.ssh/id_ed25519.pub # the .pub of the agent key to use; empty = any agent key
 
@@ -28,15 +29,16 @@ ssh_pubkey: ~/.ssh/id_ed25519.pub # the .pub of the agent key to use; empty = an
 # OPTIONAL: credentials and access
 # =============================================================================
 
-# File holding the ArvanCloud API key (must be chmod 600). Empty = use
-# $ARVAN_API_KEY, then ~/arvin-agent-badip/api_key, then the macOS Keychain.
+# PATH of a file that holds ONLY the ArvanCloud API key (not the key itself!),
+# e.g. C:/Users/Hani/arvin-agent-badip/api_key. Empty = use $ARVAN_API_KEY,
+# then ~/arvin-agent-badip/api_key, then the macOS Keychain.
 api_key_file: ""
 
 # Server UUID. Empty = `init` finds the server that owns management_ip.
 server_id: ""
 
 ssh_port: 22
-sudo: "sudo -n"                   # "" if ssh_user is root
+sudo: "sudo -n"                   # ignored when ssh_user is root
 ssh_extra_opts: []                # e.g. ["-o", "ProxyJump=bastion.example"]
 
 # =============================================================================
