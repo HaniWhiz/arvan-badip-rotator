@@ -1,141 +1,286 @@
-import os, sys, json, tempfile, subprocess, types, itertools
-home = tempfile.mkdtemp(); os.chdir(home); os.environ["ABIP_HOME"] = home; os.environ["ARVAN_API_KEY"] = "Apikey xyz"
+"""End-to-end test of arvin_agent_badip against a fake ArvanCloud API, fake VMs over a
+fake ssh, and a fake check-host. Run:  python3 tests/test_mock.py"""
+import itertools
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+home = tempfile.mkdtemp()
+os.chdir(home)
+os.environ["ABIP_HOME"] = home
+os.environ["ARVAN_API_KEY"] = "Apikey xyz"
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import arvin_agent_badip as m
+import arvin_agent_badip as m  # noqa: E402
+
 m.time.sleep = lambda s: None
-def _no_conn(*a, **k): raise OSError("mock")
+
+
+def _no_conn(*a, **k):
+    raise OSError("mock")
+
+
 m.socket.create_connection = _no_conn
 
-class FakeCloud:
-    def __init__(s):
-        s.ports = [{"id":"p-mgmt","ips":["185.1.1.10"],"mac_address":"aa:00","network_id":"n1","security_group_ids":["sg1"],"status":"ACTIVE"}]
-        s.n = itertools.count(20); s.detached=[]; s.fail_add=None
+
+class FakeServer:
+    def __init__(s, sid, net):                      # net: "185.1.1" / "185.2.2"
+        s.sid, s.net = sid, net
+        s.mgmt = net + ".10"
+        s.ports = [{"id": "p-mgmt-" + sid, "ips": [s.mgmt], "mac_address": "aa:%s" % sid[-1],
+                    "network_id": "n-" + sid, "security_group_ids": ["sg1"], "status": "ACTIVE"}]
+        s.n = itertools.count(20)
+        s.detached = []
+        s.fail_add = None
+
     def server(s):
-        return {"id":"srv1","name":"vm1","addresses":{"pub":[{"addr":ip,"is_public":True} for p in s.ports for ip in p["ips"]]}}
-cloud = FakeCloud()
+        return {"id": s.sid, "name": "vm-" + s.sid,
+                "addresses": {"pub": [{"addr": ip, "is_public": True} for p in s.ports for ip in p["ips"]]}}
+
+
+cloud = {"srv1": FakeServer("srv1", "185.1.1"), "srv2": FakeServer("srv2", "185.2.2")}
+by_ip = {c.mgmt: c for c in cloud.values()}
+keys_seen = []
+
 
 def fake_call(self, method, url, body=None, idempotent=None, allow_404=False):
+    keys_seen.append(self._key)
     path = url.split("/regions/ir-thr-ba1")[1]
-    if method=="GET" and path=="/servers": return [cloud.server()]
-    if method=="GET" and path=="/servers/srv1": return cloud.server()
-    if method=="GET" and path=="/servers/srv1/ports": return [dict(p) for p in cloud.ports]
-    if method=="GET" and path.startswith("/ports/"):
-        pid=path.split("/")[2]; return next((p for p in cloud.ports if p["id"]==pid), None)
-    if method=="GET" and path.startswith("/networks/"):
-        return {"id":"n1","subnets":[{"cidr":"185.1.1.0/24","gateway_ip":"185.1.1.1"}]}
-    if method=="GET" and path=="/quotas": return {}
-    if method=="POST" and path.endswith("/add-public-ip"):
-        assert body["security_groups"]==["sg1"]
-        k=next(cloud.n); p={"id":"p-%d"%k,"ips":["185.1.1.%d"%k],"mac_address":"bb:%02d"%k,"network_id":"n1","security_group_ids":["sg1"],"status":"ACTIVE"}
-        cloud.ports.append(p)
-        if cloud.fail_add=="lost": raise m.AmbiguousRequestError("lost")
-        return {"port_id":p["id"],"mac_addr":p["mac_address"],"fixed_ips":[{"ip_address":p["ips"][0]}]}
-    if method=="PATCH" and path.endswith("/detach"):
-        pid=path.split("/")[2]; assert pid!="p-mgmt"
-        cloud.detached.append(pid); cloud.ports=[p for p in cloud.ports if p["id"]!=pid]; return {}
+    parts = path.strip("/").split("/")
+    if method == "GET" and path == "/servers":
+        return [c.server() for c in cloud.values()]
+    if parts[0] == "servers":
+        c = cloud[parts[1]]
+        if method == "GET" and len(parts) == 2:
+            return c.server()
+        if method == "GET" and parts[2] == "ports":
+            return [dict(p) for p in c.ports]
+        if method == "POST" and parts[2] == "add-public-ip":
+            assert body["security_groups"] == ["sg1"]
+            k = next(c.n)
+            p = {"id": "p-%s-%d" % (c.sid, k), "ips": ["%s.%d" % (c.net, k)], "mac_address": "bb:%02d" % k,
+                 "network_id": "n-" + c.sid, "security_group_ids": ["sg1"], "status": "ACTIVE"}
+            c.ports.append(p)
+            if c.fail_add == "lost":
+                raise m.AmbiguousRequestError("lost")
+            return {"port_id": p["id"], "mac_addr": p["mac_address"], "fixed_ips": [{"ip_address": p["ips"][0]}]}
+    if method == "GET" and parts[0] == "ports":
+        return next((p for c in cloud.values() for p in c.ports if p["id"] == parts[1]), None)
+    if method == "GET" and parts[0] == "networks":
+        c = cloud[parts[1][2:]]
+        return {"id": parts[1], "subnets": [{"cidr": c.net + ".0/24", "gateway_ip": c.net + ".1"}]}
+    if method == "GET" and path == "/quotas":
+        return {}
+    if method == "PATCH" and parts[0] == "networks" and parts[2] == "detach":
+        pid = parts[1]
+        assert not pid.startswith("p-mgmt"), "tried to release the management port!"
+        for c in cloud.values():
+            if any(p["id"] == pid for p in c.ports):
+                assert body["server_id"] == c.sid
+                c.detached.append(pid)
+                c.ports = [p for p in c.ports if p["id"] != pid]
+        return {}
     raise AssertionError((method, path))
+
+
 m.ArvanAPI.call = fake_call
 
-scripts=[]
+scripts = []
+ssh_cmds = []
+
+
 def fake_run(self, remote, stdin=None, check=True, timeout=60, multiplex=True):
-    scripts.append((remote, stdin))
-    out=""
+    ssh_cmds.append(self.base_cmd(multiplex))
+    scripts.append((self.host, remote, stdin))
+    c = by_ip[self.host]
+    out = ""
     if remote.startswith("ip -j link"):
-        out=json.dumps([{"ifname":"eth0","address":"aa:00"}]+[{"ifname":"eth%d"%i,"address":p["mac_address"]} for i,p in enumerate(cloud.ports[1:],1)])
+        out = json.dumps([{"ifname": "eth%d" % i, "address": p["mac_address"]} for i, p in enumerate(c.ports)])
     elif remote.startswith("ip -j -4 addr"):
-        out=json.dumps([{"ifname":"eth0","addr_info":[{"local":"185.1.1.10","prefixlen":24}]}])
+        out = json.dumps([{"ifname": "eth0", "addr_info": [{"local": c.mgmt, "prefixlen": 24}]}])
     elif remote.startswith("ip -j -4 route"):
-        out=json.dumps([{"dev":"eth0","gateway":"185.1.1.1"}])
+        out = json.dumps([{"dev": "eth0", "gateway": c.net + ".1"}])
     elif remote.startswith("curl"):
-        src=remote.split("--interface ")[1].split()[0]; out=src+"\n"
-    elif "sh -s" in remote and stdin and "id -u" in stdin: out="0\n"
-    elif remote.startswith("command -v"): out="/usr/sbin/ip\n/usr/bin/curl\n"
-    elif remote.startswith("ss "): out="LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
+        out = remote.split("--interface ")[1].split()[0] + "\n"
+    elif "sh -s" in remote and stdin and "id -u" in stdin:
+        out = "0\n"
+    elif remote.startswith("command -v"):
+        out = "/usr/sbin/ip\n/usr/bin/curl\n"
+    elif remote.startswith("ss "):
+        out = "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
     return subprocess.CompletedProcess(remote, 0, out, "")
+
+
 m.Ssh.run = fake_run
 m.Ssh.close_master = lambda self: None
-m.agent_keys = lambda: (True, ["ssh-ed25519 AAA"], "1 key")
+m.agent_keys = lambda: (True, ["ssh-ed25519 AAAAPUB"], "1 key")
 
-verd = itertools.cycle(["REACHABLE","BLOCKED","BLOCKED"])
+verd = itertools.cycle(["REACHABLE", "BLOCKED", "BLOCKED"])
+
+
 def fake_cycle(self, ip, purpose):
-    v = "REACHABLE" if purpose=="baseline-mgmt" else next(verd)
-    return {"verdict":v,"why":"mock","ok":5 if v=="REACHABLE" else 0,"fail":0 if v=="REACHABLE" else 5,"unknown":0,"control_ok":3,"ok_ratio":1.0 if v=="REACHABLE" else 0.0,"link":"https://check-host.net/check-report/x"}
-m.Reachability.cycle = fake_cycle
-m.CheckHost.probe_nodes = lambda self: ["ir1","ir2","ir3"]
+    v = "REACHABLE" if purpose == "baseline-mgmt" else next(verd)
+    return {"verdict": v, "why": "mock", "ok": 5 if v == "REACHABLE" else 0, "fail": 0 if v == "REACHABLE" else 5,
+            "unknown": 0, "control_ok": 3, "ok_ratio": 1.0 if v == "REACHABLE" else 0.0,
+            "link": "https://check-host.net/check-report/x"}
 
-rc = m.main(["init","--management-ip","185.1.1.10"]); print("init rc",rc); assert rc==0
-cfg=json.load(open(home+"/config.json")); assert cfg["MANAGEMENT_PORT_ID"]=="p-mgmt" and cfg["MANAGEMENT_GATEWAY"]=="185.1.1.1", cfg
-assert m.main(["preflight"])==0
-assert m.main(["test","--dry-run"])==0
-rc = m.main(["test","--yes"]); print("test rc", rc); assert rc==0
-assert len(cloud.detached)==5 and [p["id"] for p in cloud.ports]==["p-mgmt"], cloud.detached
-rows=m.load_results(); print([ (r["round"],r["ip"],r["verdict"]) for r in rows])
-assert len(rows)==6
-assert m.main(["results","--bad"])==0
-# mgmt route pinned and unpinned
-assert any(s and "ip rule add from \"$MIP/32\"" in s for _,s in scripts)
-assert any(s and "MGMT" not in s and "ip rule del from \"$MIP/32\"" in s for _,s in scripts)
+
+m.Reachability.cycle = fake_cycle
+m.CheckHost.probe_nodes = lambda self: ["ir1", "ir2", "ir3"]
+
+y = os.path.join(home, "in.yaml")
+
+
+def yaml(text):
+    open(y, "w").write(text)
+    return ["--config", y]
+
+
+S1, S2 = "185.1.1.10", "185.2.2.10"
+
+# ---- single server ----------------------------------------------------------------
+C = yaml("management_ip: %s\nssh_key: ssh-ed25519 AAAAPUB me@mac\n" % S1)
+assert m.main(C + ["init"]) == 0
+cfg = json.load(open(m.config_path(S1)))
+assert cfg["MANAGEMENT_PORT_ID"] == "p-mgmt-srv1" and cfg["MANAGEMENT_GATEWAY"] == "185.1.1.1", cfg
+assert m.main(C + ["preflight"]) == 0
+assert m.main(C + ["test", "--dry-run"]) == 0
+assert m.main(C + ["test", "--yes"]) == 0
+c1 = cloud["srv1"]
+assert len(c1.detached) == 5 and [p["id"] for p in c1.ports] == ["p-mgmt-srv1"], c1.detached
+rows = m.load_results()
+assert len(rows) == 6 and all(r["server"] == S1 for r in rows), rows
+assert any(s and 'ip rule add from "$MIP/32"' in s for _, _, s in scripts)
+assert any(s and 'ip rule del from "$MIP/32"' in s for _, _, s in scripts)
+# ssh used the inline public key through a written .pub file
+idf = [x for x in ssh_cmds[-1] if x.startswith("IdentityFile=")][0].split("=", 1)[1]
+assert idf.endswith(".pub") and open(idf).read().startswith("ssh-ed25519 AAAAPUB"), idf
 
 # lost allocation reply -> reconciled by port diff
-cloud.fail_add="lost"
-rc = m.main(["test","--yes","--rounds","1","--no-baseline"]); assert rc==0, rc
-assert [p["id"] for p in cloud.ports]==["p-mgmt"]
+c1.fail_add = "lost"
+assert m.main(C + ["test", "--yes", "--rounds", "1", "--no-baseline"]) == 0
+assert [p["id"] for p in c1.ports] == ["p-mgmt-srv1"]
+c1.fail_add = None
 
-# crash after POST (pending left) -> cleanup
-cloud.fail_add=None
-orig=m.Agent._configure_and_test
-def boom(self,p,r): raise KeyboardInterrupt
-m.Agent._configure_and_test=boom
-orig_rel=m.Agent.release
-m.Agent.release=lambda self,p: (_ for _ in ()).throw(KeyboardInterrupt())
-rc=m.main(["test","--yes","--rounds","1","--no-baseline"]); print("crash rc",rc)
-m.Agent.release=orig_rel; m.Agent._configure_and_test=orig
-assert m.State().pending and len(cloud.ports)==2
-assert m.main(["test","--yes"])==1   # refuses with pending
-assert m.main(["cleanup","--yes"])==0
-assert [p["id"] for p in cloud.ports]==["p-mgmt"] and not m.State().pending
-print("ALL OK")
+# crash after POST (pending left) -> refuses to test -> cleanup
+orig_cat, orig_rel = m.Agent._configure_and_test, m.Agent.release
 
-# ---- YAML inputs ----------------------------------------------------------
+
+def boom(self, p, r):
+    raise KeyboardInterrupt
+
+
+m.Agent._configure_and_test = boom
+m.Agent.release = lambda self, p: (_ for _ in ()).throw(KeyboardInterrupt())
+m.main(C + ["test", "--yes", "--rounds", "1", "--no-baseline"])
+m.Agent._configure_and_test, m.Agent.release = orig_cat, orig_rel
+assert m.State(S1).pending and len(c1.ports) == 2
+assert m.main(C + ["test", "--yes"]) == 1
+assert m.main(C + ["cleanup", "--yes"]) == 0
+assert [p["id"] for p in c1.ports] == ["p-mgmt-srv1"] and not m.State(S1).pending
+print("SINGLE OK")
+
+# ---- several servers, comma separated -------------------------------------------------
+C = yaml('management_ip: "%s, %s"\nrounds: 2\nbaseline_check: false\n' % (S1, S2))
+assert m.main(C + ["init"]) == 0
+assert json.load(open(m.config_path(S2)))["SERVER_ID"] == "srv2"
+assert m.main(C + ["preflight"]) == 0
+n1, n2 = len(c1.detached), len(cloud["srv2"].detached)
+assert m.main(C + ["test", "--yes"]) == 0
+assert len(c1.detached) == n1 + 2 and len(cloud["srv2"].detached) == n2 + 2
+assert [p["id"] for p in cloud["srv2"].ports] == ["p-mgmt-srv2"]
+srv2_rows = [r for r in m.load_results() if r.get("server") == S2]
+assert len(srv2_rows) == 2 and all(r["ip"].startswith("185.2.2.") for r in srv2_rows), srv2_rows
+# --server limits a run to one of them
+n1 = len(c1.detached)
+assert m.main(C + ["--server", S2, "test", "--yes", "--rounds", "1"]) == 0
+assert len(c1.detached) == n1
+assert m.main(C + ["--server", "9.9.9.9", "status"]) == 1
+# YAML list form works too
+C = yaml("management_ip: [%s, %s]\n" % (S1, S2))
+assert m.main(C + ["status"]) == 0
+# server_id must match the number of IPs
+C = yaml('management_ip: "%s, %s"\nserver_id: srv1\n' % (S1, S2))
+assert m.main(C + ["status"]) == 1
+print("MULTI OK")
+
+# ---- API key: value or path ------------------------------------------------------------
+saved = os.environ.pop("ARVAN_API_KEY")
+kf = os.path.join(home, "key.txt")
+open(kf, "w").write("Apikey from-file\n")
+os.chmod(kf, 0o600)
+assert m.load_api_key("apikey 11111111-2222-3333-4444-555555555555")[0] == "11111111-2222-3333-4444-555555555555"
+assert m.load_api_key("11111111-2222-3333-4444-555555555555")[0] == "11111111-2222-3333-4444-555555555555"
+assert m.load_api_key(kf) == ("from-file", "file:%s" % kf)
+try:
+    m.load_api_key("C:/nope/key.txt")
+    raise SystemExit("accepted missing key file")
+except m.AgentError as e:
+    print("rejected:", e)
+C = yaml('management_ip: %s\napi_key: "Apikey yaml-value"\n' % S1)
+keys_seen.clear()
+assert m.main(C + ["preflight"]) == 0 and keys_seen and set(keys_seen) == {"yaml-value"}
+C = yaml("management_ip: %s\napi_key_file: %s\n" % (S1, kf))       # old name still works
+keys_seen.clear()
+assert m.main(C + ["preflight"]) == 0 and set(keys_seen) == {"from-file"}
+os.environ["ARVAN_API_KEY"] = saved
+print("API KEY OK")
+
+# ---- SSH key: value or path --------------------------------------------------------------
+priv_text = "-----BEGIN OPENSSH PRIVATE KEY-----\\nAAAA\\nBBBB\\n-----END OPENSSH PRIVATE KEY-----"
+base = m.load_config({}, None)
+base.update(SSH_KEY=priv_text)
+path, pub, kind = m.resolve_ssh_identity(base)
+assert kind == "private" and open(path).read().splitlines()[1] == "AAAA"
+assert (os.stat(path).st_mode & 0o777) == 0o600
+pf = os.path.join(home, "id_test")
+open(pf, "w").write("x")
+base.update(SSH_KEY=pf)
+assert m.resolve_ssh_identity(base) == (pf, None, "private")
+open(pf + ".pub", "w").write("ssh-ed25519 AAAAPUB c\n")
+base.update(SSH_KEY=pf + ".pub")
+assert m.resolve_ssh_identity(base) == (pf + ".pub", "ssh-ed25519 AAAAPUB", "agent-pub")
+base.update(SSH_KEY="~/nope/id_ed25519")
+try:
+    m.resolve_ssh_identity(base)
+    raise SystemExit("accepted missing ssh key")
+except m.AgentError as e:
+    print("rejected:", e)
+C = yaml('management_ip: %s\nssh_key: "%s"\n' % (S1, priv_text))
+assert m.main(C + ["preflight"]) == 0
+print("SSH KEY OK")
+
+# ---- YAML parser ----------------------------------------------------------------------
 repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 tpl = m.load_yaml_inputs(os.path.join(repo, "arvin-agent-badip.yaml"))
-assert tpl["SSH_USER"] == "hani" and tpl["ROUNDS"] == 5 and tpl["PROBE_NODES"] == [] \
-    and tpl["IRAN_CONTROL_TARGET"] == "1.1.1.1:443" and "MANAGEMENT_IP" not in tpl, tpl
-y = os.path.join(home, "in.yaml")
-open(y, "w").write('management_ip: 185.1.1.10   # mgmt\nrounds: 2\nssh_extra_opts:\n  - "-o"\n  - "ProxyJump=b # x"\n'
-                   'check_type: ping\nbaseline_check: no\n')
-d = m.load_yaml_inputs(y)
-assert d == {"MANAGEMENT_IP": "185.1.1.10", "ROUNDS": 2, "SSH_EXTRA_OPTS": ["-o", "ProxyJump=b # x"],
-             "CHECK_TYPE": "ping", "BASELINE_CHECK": False}, d
-for bad in ("rounds: five\n", "api_key: abc\n", "foo: 1\n", "a:\n  b: 1\n"):
+assert tpl["ROUNDS"] == 5 and tpl["PROBE_NODES"] == [] and "MANAGEMENT_IP" not in tpl, tpl
+open(y, "w").write('management_ip: 185.1.1.10   # mgmt\nrounds: 2\nssh_extra_opts:\n  - "-o"\n'
+                   '  - "ProxyJump=b # x"\ncheck_type: ping\nbaseline_check: no\n')
+assert m.load_yaml_inputs(y) == {"MANAGEMENT_IP": "185.1.1.10", "ROUNDS": 2,
+                                 "SSH_EXTRA_OPTS": ["-o", "ProxyJump=b # x"],
+                                 "CHECK_TYPE": "ping", "BASELINE_CHECK": False}
+for bad in ("rounds: five\n", "foo: 1\n", "a:\n  b: 1\n"):
     open(y, "w").write(bad)
     try:
-        m.load_yaml_inputs(y); raise SystemExit("accepted bad yaml: %r" % bad)
+        m.load_yaml_inputs(y)
+        raise SystemExit("accepted bad yaml: %r" % bad)
     except m.AgentError as e:
         print("rejected:", e)
-open(y, "w").write("rounds: 1\nno_baseline_dummy_removed: 1\n".split("\n")[0] + "\nbaseline_check: false\n")
-n0 = len(cloud.detached)
-assert m.main(["--config", y, "test", "--yes"]) == 0 and len(cloud.detached) == n0 + 1
-open(y, "w").write("management_ip: 185.9.9.9\n")
-assert m.main(["--config", y, "status"]) == 1     # differs from init -> must re-run init
+C = yaml("management_ip: 185.1.1.10, 1.2.3\n")
+assert m.main(C + ["status"]) == 1
 print("YAML OK")
 
-# ---- Windows behaviour -----------------------------------------------------
+# ---- Windows behaviour -------------------------------------------------------------------
 m.IS_WINDOWS = True
-open(y, "w").write("ssh_user: root\n"); cfgw = m.load_config({}, y)
-ssh = m.Ssh(cfgw, m.EventLog(cfgw, quiet=True))
+cw = m.server_config(m.load_config({"SSH_USER": "root"}, None), S1, 0, 1)
+ssh = m.Ssh(cw, m.EventLog(cw, quiet=True))
 cmd = " ".join(ssh.base_cmd())
 assert "ControlMaster" not in cmd and "ControlPath" not in cmd, cmd
 assert ssh.sudo_prefix() == ""
-for bad in ("apikey 11111111-2222-3333-4444-555555555555", "11111111-2222-3333-4444-555555555555"):
-    try:
-        m.load_api_key(bad); raise SystemExit("accepted key as path")
-    except m.AgentError as e:
-        assert "1111" not in str(e); print("rejected key-as-path:", str(e)[:60])
-kf = os.path.join(home, "k.txt"); open(kf, "w").write("Apikey abc\n"); os.chmod(kf, 0o644)
-saved = os.environ.pop("ARVAN_API_KEY")
-assert m.load_api_key(kf)[0] == "abc"          # no chmod check on Windows
-os.environ["ARVAN_API_KEY"] = saved
+os.chmod(kf, 0o644)
+assert m.load_api_key(kf)[0] == "from-file"          # no chmod check on Windows
 m.IS_WINDOWS = False
 assert m.main([]) == 1
 print("WINDOWS OK")
+print("ALL OK")
