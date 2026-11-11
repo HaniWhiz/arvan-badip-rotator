@@ -848,6 +848,7 @@ class ArvanAPI:
         """Every port of THIS server, from the networks listing:
         [{ip, port_id, mac, public, float_ip, version, network_id, network_name, cidr, gateway}]."""
         out: List[Dict[str, Any]] = []
+        seen: set = set()
         for n in (networks if networks is not None else self.list_networks()):
             for sn in n.get("subnets") or []:
                 for srv in sn.get("servers") or []:
@@ -857,6 +858,10 @@ class ArvanAPI:
                         ip = x.get("ip") or x.get("ip_address") or x.get("addr")
                         if not ip:
                             continue
+                        key = (x.get("port_id") or x.get("id"), ip)
+                        if key in seen:          # the same port is listed under several subnets
+                            continue
+                        seen.add(key)
                         out.append({"ip": ip,
                                     "port_id": x.get("port_id") or x.get("id"),
                                     "mac": str(x.get("mac_address") or x.get("mac_addr") or "").lower(),

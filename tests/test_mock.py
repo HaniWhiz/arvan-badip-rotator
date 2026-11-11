@@ -326,6 +326,16 @@ ctx = m.make_ssl_context()
 assert ctx.verify_mode == m.ssl.CERT_REQUIRED and ctx.check_hostname
 print("TLS OK")
 
+# ---- a port listed under two subnets is counted once -----------------------------------------
+dup_nets = fake_networks()
+dup_nets[0]["subnets"].append(dict(dup_nets[0]["subnets"][0]))
+cdup = m.server_config(m.load_config({}, None), S1, 0, 1)
+inv_dup = m.ArvanAPI(cdup, m.Http(cdup, m.EventLog(cdup, quiet=True)), "k")
+inv_dup.server_id = "srv1"
+assert len(inv_dup.public_inventory()) == len(inv_dup.public_inventory()) and \
+    len(inv_dup.ports(dup_nets)) == len(inv_dup.ports(fake_networks()))
+print("DUPLICATE OK")
+
 # ---- SSH: normal commands reuse the master and never authenticate ---------------------------
 cs = m.server_config(m.load_config({}, None), S1, 0, 1)
 cmdl = m.Ssh(cs, m.EventLog(cs, quiet=True)).base_cmd()
