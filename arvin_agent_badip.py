@@ -79,6 +79,12 @@ DEFAULTS: Dict[str, Any] = {
     "SERVER_ID": "",                  # found by `init` from the management IP
     "SERVER_NAME": "",
     "IP_TYPE": "ipv4",
+    # Firewall (ArvanCloud "security group") given to every NEW public IP. ArvanCloud refuses
+    # the request without one ("At least one firewall should be selected").
+    # FIREWALL_NAME: the name shown in the panel's Firewall list. FIREWALL_ID overrides it.
+    # Both empty -> reuse the firewalls the management IP already has.
+    "FIREWALL_NAME": "Default",
+    "FIREWALL_ID": "",
 
     # ---- Management access (never released) -------------------------------
     "MANAGEMENT_IP": "",              # one IP, or several servers: "1.2.3.4, 5.6.7.8"
@@ -819,6 +825,25 @@ class ArvanAPI:
                        "%s | raw response: %s" % (_api_message(resp), resp.text[:400]),
                        resp.headers.get("x-ar-request-id"))
 
+    def list_firewalls(self) -> List[Dict[str, Any]]:
+        """GET /securities (the panel's Firewall list): [{id, name}]."""
+        return self.call("GET", self._r("/securities")) or []
+
+    def firewall_for_new_ip(self) -> List[str]:
+        cfg = self.cfg
+        if cfg.get("FIREWALL_ID"):
+            return [str(cfg["FIREWALL_ID"]).strip()]
+        if cfg.get("FIREWALL_NAME"):
+            want = str(cfg["FIREWALL_NAME"]).strip().lower()
+            fws = self.list_firewalls()
+            hit = [f for f in fws if str(f.get("name") or "").strip().lower() == want]
+            if not hit:
+                raise AbortRun("no firewall named %r in the panel; names available: %s. Set "
+                               "firewall_name in the YAML file to one of these"
+                               % (cfg["FIREWALL_NAME"], ", ".join(str(f.get("name")) for f in fws) or "none"))
+            return [str(hit[0]["id"])]
+        return self.server_security_group_ids()
+
     def server_security_group_ids(self) -> List[str]:
         out = []
         for g in self.get_server().get("security_groups") or []:
@@ -848,6 +873,7 @@ class ArvanAPI:
         """Every port of THIS server, from the networks listing:
         [{ip, port_id, mac, public, float_ip, version, network_id, network_name, cidr, gateway}]."""
         out: List[Dict[str, Any]] = []
+        seen: set = set()
         for n in (networks if networks is not None else self.list_networks()):
             for sn in n.get("subnets") or []:
                 for srv in sn.get("servers") or []:
@@ -857,6 +883,10 @@ class ArvanAPI:
                         ip = x.get("ip") or x.get("ip_address") or x.get("addr")
                         if not ip:
                             continue
+                        key = (x.get("port_id") or x.get("id"), ip)
+                        if key in seen:          # the same port is listed under several subnets
+                            continue
+                        seen.add(key)
                         out.append({"ip": ip,
                                     "port_id": x.get("port_id") or x.get("id"),
                                     "mac": str(x.get("mac_address") or x.get("mac_addr") or "").lower(),
@@ -1708,7 +1738,7 @@ class Agent:
         self.state.data["pending"] = pend
         self.state.save()                                   # write-ahead before the billable POST
         # ---- 1) allocate --------------------------------------------------------
-        self.log.info("allocate_request", round=n)
+        self.log.info("allocate_request", round=n, firewall_name=cfg.get("FIREWALL_NAME"))
         data: Any = None
         try:
             data = self._allocate_call()
@@ -1777,18 +1807,11 @@ class Agent:
         return rec
 
     def _allocate_call(self) -> Any:
-        """Send add-public-ip. If ArvanCloud refuses it (not a transient error), a refusal
-        creates nothing, so try once more in the format the older API notes used:
-        {"type": "ipv4", "security_groups": [...]}. A transient error is not retried here."""
-        try:
-            return self.api.add_public_ip()
-        except ApiError as first:
-            if first.transient:
-                raise
-            sg = self.api.server_security_group_ids()
-            self.log.warning("allocate_refused_retrying_with_body", error=str(first),
-                             body={"type": self.cfg["IP_TYPE"], "security_groups": sg})
-            return self.api.add_public_ip({"type": self.cfg["IP_TYPE"], "security_groups": sg})
+        """Send add-public-ip with the default firewall: {"type": "ipv4", "security_groups": [id]}.
+        ArvanCloud refuses a request with no firewall, and a refusal creates nothing."""
+        fw = self.api.firewall_for_new_ip()
+        self.log.info("allocate_firewall", firewall_name=self.cfg.get("FIREWALL_NAME"), firewall_ids=fw)
+        return self.api.add_public_ip({"type": self.cfg["IP_TYPE"], "security_groups": fw})
 
     def _configure_and_test(self, pend: Dict[str, Any], rec: Dict[str, Any]) -> None:
         cfg, ip = self.cfg, pend["ip"]

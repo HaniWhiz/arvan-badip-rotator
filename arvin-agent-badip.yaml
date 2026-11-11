@@ -43,6 +43,11 @@ ssh_key: ~/.ssh/id_ed25519.pub
 # Empty = $ARVAN_API_KEY, then ~/arvin-agent-badip/api_key, then the macOS Keychain.
 api_key: ""
 
+# Firewall for every NEW public IP: the name shown in the panel's Firewall list.
+# ArvanCloud refuses a new IP without one.
+firewall_name: "Default"
+firewall_id: ""                   # optional: the firewall's ID instead of its name
+
 # Server UUID(s). Empty = `init` finds the server that owns each management IP.
 # Several servers: one UUID per management IP, comma-separated, same order.
 server_id: ""

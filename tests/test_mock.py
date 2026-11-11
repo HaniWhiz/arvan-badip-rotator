@@ -70,12 +70,14 @@ def fake_call(self, method, url, body=None, idempotent=None, allow_404=False, em
         return fake_networks()
     if method == "GET" and path == "/quotas":
         return {}
+    if method == "GET" and path == "/securities":
+        return [{"id": "sg1", "name": "Default"}, {"id": "sg2", "name": "allow-any"}]
     if parts[0] == "servers":
         c = cloud[parts[1]]
         if method == "GET" and len(parts) == 2:
             return c.server()
         if method == "POST" and parts[2] == "add-public-ip":
-            if body is None:                         # like the real API: empty body refused
+            if body is None or not body.get("security_groups"):   # no firewall: refused, like the API
                 raise m.ApiError("POST", url, 422, "Bad Request", None)
             assert body == {"type": "ipv4", "security_groups": ["sg1"]}, body
             k = next(c.n)
@@ -326,8 +328,32 @@ ctx = m.make_ssl_context()
 assert ctx.verify_mode == m.ssl.CERT_REQUIRED and ctx.check_hostname
 print("TLS OK")
 
+# ---- a port listed under two subnets is counted once -----------------------------------------
+dup_nets = fake_networks()
+dup_nets[0]["subnets"].append(dict(dup_nets[0]["subnets"][0]))
+cdup = m.server_config(m.load_config({}, None), S1, 0, 1)
+inv_dup = m.ArvanAPI(cdup, m.Http(cdup, m.EventLog(cdup, quiet=True)), "k")
+inv_dup.server_id = "srv1"
+assert len(inv_dup.public_inventory()) == len(inv_dup.public_inventory()) and \
+    len(inv_dup.ports(dup_nets)) == len(inv_dup.ports(fake_networks()))
+print("DUPLICATE OK")
+
 # ---- SSH: normal commands reuse the master and never authenticate ---------------------------
 cs = m.server_config(m.load_config({}, None), S1, 0, 1)
 cmdl = m.Ssh(cs, m.EventLog(cs, quiet=True)).base_cmd()
 assert "ControlMaster=no" in cmdl and "BatchMode=yes" in cmdl and "ControlPath=/tmp/abip-%C" in cmdl
 print("SSH MASTER OK")
+
+# ---- firewall by name ------------------------------------------------------------------------
+cfw = m.server_config(m.load_config({}, None), S1, 0, 1)
+apifw = m.ArvanAPI(cfw, m.Http(cfw, m.EventLog(cfw, quiet=True)), "k")
+apifw.server_id = "srv1"
+assert apifw.firewall_for_new_ip() == ["sg1"]                     # "Default" by name
+cfw["FIREWALL_NAME"] = "allow-any"; assert apifw.firewall_for_new_ip() == ["sg2"]
+cfw["FIREWALL_NAME"] = ""; cfw["FIREWALL_ID"] = "sg9"; assert apifw.firewall_for_new_ip() == ["sg9"]
+cfw["FIREWALL_ID"] = ""; cfw["FIREWALL_NAME"] = "nope"
+try:
+    apifw.firewall_for_new_ip(); raise SystemExit("accepted unknown firewall name")
+except m.AbortRun as e:
+    print("rejected:", str(e)[:80])
+print("FIREWALL OK")

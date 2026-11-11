@@ -76,6 +76,8 @@ All inputs are in one flat YAML file. [`arvin-agent-badip.yaml`](arvin-agent-bad
 | `ssh_user` | `hani` |
 | `ssh_key` | see below |
 
+**Firewall:** ArvanCloud refuses a new public IP without a firewall. `firewall_name` (default `Default`) is the name shown in the panel's Firewall list, and the script uses that firewall for every new IP. `firewall_id` can be used instead.
+
 Everything else is optional: `api_key`, `server_id`, `rounds`, `checks_per_ip`, `check_type`, `check_port`, timeouts, and so on.
 
 **`api_key` and `ssh_key` each accept a file path or the value itself:**
