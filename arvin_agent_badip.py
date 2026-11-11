@@ -1242,8 +1242,8 @@ class Ssh:
         """Public IP seen by echo services for traffic sourced from src_ip."""
         seen: Dict[str, int] = {}
         for url in self.cfg["EGRESS_ECHO_URLS"]:
-            p = self.run("curl -4 -s --max-time 8 --interface %s %s || "
-                         "wget -4 -q -T 8 --bind-address=%s -O - %s"
+            p = self.run("curl -4 -s --noproxy '*' --max-time 8 --interface %s %s || "
+                         "wget -4 -q --no-proxy -T 8 --bind-address=%s -O - %s"
                          % (shlex.quote(src_ip), shlex.quote(url), shlex.quote(src_ip), shlex.quote(url)),
                          check=False, timeout=40)
             words = p.stdout.split()
@@ -1550,10 +1550,17 @@ class Agent:
                 row(True, "quotas read", "ok")
         except AgentError as exc:
             row(False, "arvan api", str(exc))
+        ssh_ok = False
+        try:
+            self.ssh.run("true")
+            ssh_ok = True
+        except SshError:
+            pass
+        # the ssh login itself is the real test; the agent only matters when it fails
         ok, keys, msg = agent_keys()
-        if self.ssh.key_kind == "private":
-            row(True, "ssh key", "private key file %s" % self.ssh.identity)
-            row(True if ok else None, "ssh-agent", msg + " (optional with a private key file)")
+        if ssh_ok or self.ssh.key_kind == "private":
+            if not ok:
+                row(None, "ssh-agent", "not running or empty; not needed, the ssh login works without it")
         else:
             row(ok, "ssh-agent", msg)
             if ok and self.ssh.key_kind == "agent-pub":
@@ -1564,7 +1571,12 @@ class Agent:
             self.ssh.run("true")
             row(True, "ssh", "%s@%s:%s" % (cfg["SSH_USER"], cfg["MANAGEMENT_IP"], cfg["SSH_PORT"]))
             p = self.ssh.sudo_sh("id -u", check=False)
-            row(p.returncode == 0 and p.stdout.strip() == "0", "passwordless sudo",
+            sudo_ok = p.returncode == 0 and p.stdout.strip() == "0"
+            if not sudo_ok:
+                print("       fix, on the server:  echo '%s ALL=(ALL) NOPASSWD:ALL' | sudo tee "
+                      "/etc/sudoers.d/90-%s-nopasswd && sudo chmod 440 /etc/sudoers.d/90-%s-nopasswd"
+                      % ((cfg["SSH_USER"],) * 3))
+            row(sudo_ok, "passwordless sudo",
                 (p.stderr or p.stdout).strip()[:120] or "ok")
             p = self.ssh.run("command -v ip; command -v curl || command -v wget", check=False)
             tools = p.stdout.split()
@@ -1578,7 +1590,12 @@ class Agent:
                     "port %d %s" % (port, "listens on all addresses" if wild else
                                     "NOT seen on 0.0.0.0/:: (test IPs would look DOWN)"))
             eg = self.ssh.egress_from(cfg["MANAGEMENT_IP"])
-            row(eg == cfg["MANAGEMENT_IP"], "mgmt egress ip", str(eg))
+            if eg == cfg["MANAGEMENT_IP"]:
+                row(True, "mgmt egress ip", str(eg))
+            else:
+                # not fatal: the test measures INBOUND reachability of each test IP
+                row(None, "mgmt egress ip", "%s (outbound traffic leaves through another address: a VPN, "
+                                            "tunnel or provider NAT; inbound tests still work)" % eg)
             if cfg["PROTECT_MGMT_ROUTE"]:
                 row(bool(cfg["MANAGEMENT_GATEWAY"] and cfg["MANAGEMENT_IFACE"]), "mgmt route data",
                     "%s via %s" % (cfg["MANAGEMENT_IFACE"], cfg["MANAGEMENT_GATEWAY"]))
