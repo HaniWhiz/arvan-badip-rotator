@@ -1704,9 +1704,16 @@ class Agent:
             except ApiError as exc:
                 if exc.kind != "not_found":
                     raise
-        gone = self._wait_for(lambda: not any(x["port_id"] == port_id for x in self.api.public_inventory()),
-                              self.cfg["RELEASE_TIMEOUT_SEC"], 5)
+        def still_attached() -> bool:
+            # the port listing AND the server's own address list must both drop the IP
+            in_ports = any(x["port_id"] == port_id or x["ip"] == ip for x in self.api.public_inventory())
+            in_server = ip in ArvanAPI.server_ipv4s(self.api.get_server())
+            return in_ports or in_server
+
+        gone = self._wait_for(lambda: not still_attached(), self.cfg["RELEASE_TIMEOUT_SEC"], 5)
         if not gone:
+            self.log.error("release_not_confirmed", ip=ip, port_id=port_id,
+                           detail="the API still lists the IP on the server; remove it in the panel")
             return False
         self.log.info("released", ip=ip, port_id=port_id)
         return True
