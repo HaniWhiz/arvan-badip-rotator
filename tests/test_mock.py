@@ -399,3 +399,15 @@ assert res["by_region"]["iran"] == {"ok": 3, "fail": 0, "unknown": 0}, res["by_r
 assert res["by_region"]["europe"] == {"ok": 0, "fail": 1, "unknown": 0}, res["by_region"]
 assert res["verdict"] == "REACHABLE", res["verdict"]           # Iran only decides
 print("REGIONS OK")
+
+# ---- DOWN verdict: diagnostics are collected before the release ---------------------------------
+m.Reachability.cycle = lambda self, ip, purpose: {"verdict": "DOWN", "why": "mock", "ok": 0, "fail": 5,
+                                                  "unknown": 0, "control_ok": 0, "ok_ratio": 0.0,
+                                                  "link": "l", "by_region": {"iran": {"ok": 0, "fail": 5, "unknown": 0}}}
+C = yaml("management_ip: %s\n" % S1)
+nd = len(cloud["srv1"].detached)
+assert m.main(C + ["test", "--yes", "--rounds", "1"]) == 0
+last = m.load_results()[-1]
+assert last["verdict"] == "UNTESTABLE" and len(last["cycles"]) == 1 and os.path.isfile(last["diag_file"]), last
+assert len(cloud["srv1"].detached) == nd + 1 and "ping gateway" in [s for _, _, s in scripts if s and "rp_filter" in s][-1]
+print("DIAG OK")

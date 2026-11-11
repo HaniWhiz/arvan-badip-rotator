@@ -1472,6 +1472,32 @@ done
 echo up
 """
 
+# Read-only facts about a test IP that is unreachable from everywhere (verdict DOWN).
+TESTIP_DIAG_SH = r"""
+set +e
+echo "== address on $IF";            ip -4 addr show dev "$IF"
+echo "== link state / counters";     ip -s link show dev "$IF"
+RX1=$(cat /sys/class/net/$IF/statistics/rx_packets 2>/dev/null)
+echo "== policy rules";              ip rule show
+echo "== table $T";                  ip route show table "$T"
+echo "== main table default";        ip route show default
+echo "== route for replies from $IP"; ip route get 1.1.1.1 from "$IP"
+echo "== rp_filter";                 sysctl net.ipv4.conf.all.rp_filter "net.ipv4.conf.$IF.rp_filter"
+echo "== neighbour (gateway ARP)";   ip neigh show dev "$IF"
+echo "== ping gateway $GW from $IP"; ping -c 2 -W 2 -I "$IP" "$GW" 2>&1 | tail -3
+echo "== ping 1.1.1.1 from $IP";     ping -c 2 -W 2 -I "$IP" 1.1.1.1 2>&1 | tail -3
+echo "== listeners on port $PORT";   (ss -ltnH 2>/dev/null || netstat -ltn) | grep -E ":$PORT\\b" | head -5
+echo "== local tcp to $IP:$PORT";    (timeout 3 bash -c "echo > /dev/tcp/$IP/$PORT" 2>/dev/null && echo open) || \
+                                     (command -v nc >/dev/null && nc -z -w 3 "$IP" "$PORT" && echo open) || echo "not open / no tool"
+echo "== ufw";                       ufw status 2>/dev/null | head -8
+echo "== nftables (first lines)";    nft list ruleset 2>/dev/null | head -40
+echo "== iptables (first lines)";    iptables -S 2>/dev/null | head -20
+sleep 5
+RX2=$(cat /sys/class/net/$IF/statistics/rx_packets 2>/dev/null)
+echo "== packets received on $IF in 5 s: $((RX2 - RX1))"
+true
+"""
+
 TESTIP_DOWN_SH = r"""
 while ip rule show | grep -q "from $IP lookup"; do ip rule del from "$IP/32" || break; done
 ip route flush table "$T" 2>/dev/null || true
@@ -1946,6 +1972,45 @@ class Agent:
                     t[k] += int(d.get(k) or 0)
             if res.get("link"):
                 rec["links"].append(res["link"])
+            if res.get("verdict") == DOWN:
+                # unreachable from every region: a server/network fault, not an Iran block.
+                # Collect facts while the IP is still up; more cycles would say the same.
+                self._diagnose_down(pend, rec)
+                break
+
+    def _diagnose_down(self, pend: Dict[str, Any], rec: Dict[str, Any]) -> None:
+        cfg, ip = self.cfg, pend["ip"]
+        out = ["test IP %s on %s, iface %s, subnet %s, gateway %s"
+               % (ip, cfg["MANAGEMENT_IP"], pend.get("iface"), pend.get("cidr"), pend.get("gateway")),
+               "tcp %s:%s from this computer: %s" % (ip, cfg["CHECK_PORT"], rec.get("from_mac_tcp")), ""]
+        try:
+            p = self.ssh.sudo_sh(sh_vars(IF=pend.get("iface") or "", IP=ip, GW=pend.get("gateway") or "",
+                                         T=pend.get("table"), PORT=cfg["CHECK_PORT"]) + TESTIP_DIAG_SH,
+                                 check=False, timeout=90)
+            out.append(p.stdout + (("\n[stderr]\n" + p.stderr) if p.stderr.strip() else ""))
+        except AgentError as exc:
+            out.append("could not collect from the VM: %s" % exc)
+        if cfg["CHECK_TYPE"] != "ping":             # does ICMP get through when TCP does not?
+            saved = cfg["CHECK_TYPE"]
+            try:
+                cfg["CHECK_TYPE"] = "ping"
+                pr = self.reach.cycle(ip, "diag-ping")
+                out.append("\ncheck-host PING from all regions: %s (%s) %s  %s"
+                           % (pr.get("verdict"), pr.get("why"), regions_text(pr.get("by_region") or {}),
+                              pr.get("link")))
+                rec["diag_ping"] = pr.get("verdict")
+            except AgentError as exc:
+                out.append("\ncheck-host ping failed: %s" % exc)
+            finally:
+                cfg["CHECK_TYPE"] = saved
+        path = os.path.join(server_dir(cfg["MANAGEMENT_IP"]), "diag-%s.txt" % ip)
+        with contextlib.suppress(OSError):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(out) + "\n")
+        rec["diag_file"] = path
+        print("\n----- diagnostics for DOWN test IP %s (saved to %s) -----" % (ip, path))
+        print("\n".join(out))
+        print("----- end of diagnostics -----\n", flush=True)
 
     # -------------------------------------------------------------------- run --
     def test(self, rounds: int) -> int:
