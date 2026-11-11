@@ -11,7 +11,22 @@ The tool is one file, `arvin_agent_badip.py`, and needs only the Python 3.8+ sta
 
 The management IP is never released, and neither is its port or any port that existed before a round. Only the port the round created is released.
 
-## What one round does
+## Two modes
+
+`vm_config_mode` in the YAML file chooses how a new IP gets configured on the server.
+
+**`panel` (default).** On ArvanCloud the panel does it: when an IP is added it writes the netplan config and the route on the server, and when the IP is deleted it removes them. While a test IP is attached the **management IP is unusable**, so in this mode the script never uses SSH:
+
+1. Add the IP through the API.
+2. Wait `new_ip_settle_sec` (45 s) for the panel to configure it.
+3. Test it from Iran and the other regions.
+4. Remove it through the API and wait for the management IP to answer again.
+
+Only the API key is needed. `ssh_user` and `ssh_key` are ignored.
+
+**`ssh`.** For images where nothing configures the new card: the script does it over SSH, as described below.
+
+## What one round does (ssh mode)
 
 1. **Allocate:** `POST /servers/{id}/add-public-ip` with an empty body. This is billable. The pending allocation is written to `state.json` *before* the request is sent. The reply carries no port details, so the new port is found by comparing the port list from `GET /networks` with the one saved before the request.
 2. **Configure (SSH + sudo):**

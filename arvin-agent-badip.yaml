@@ -22,7 +22,13 @@ management_ip: ""                 # e.g. "185.1.1.10" or "185.1.1.10, 185.2.2.20
 # ArvanCloud region code of the server (shown in the panel / API).
 region: ir-thr-ba1
 
-# SSH access to the VM(s). The same user and key are used for every server.
+# How a new IP gets configured on the server:
+#   panel = ArvanCloud does it (default). No SSH is used; only the API key is needed.
+#           The management IP is unusable while a test IP is attached.
+#   ssh   = this script configures the new network card over SSH.
+vm_config_mode: panel
+
+# SSH access to the VM(s). Only used when vm_config_mode is ssh. The same user and key are used for every server.
 ssh_user: hani
 # ssh_key, any of:
 #   ~/.ssh/id_ed25519.pub              .pub of a key in your ssh-agent (macOS default)

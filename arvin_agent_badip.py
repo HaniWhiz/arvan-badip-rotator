@@ -101,6 +101,15 @@ DEFAULTS: Dict[str, Any] = {
     # test NIC. The VM's own network service can undo these when a NIC is hot-plugged,
     # which cuts the management connection. The guard stops by itself this many seconds
     # after the last heartbeat from this computer.
+    # How a new IP gets configured inside the VM:
+    #   panel -> ArvanCloud does it: it writes the netplan config and the route when an IP
+    #            is added, and removes them when it is deleted. While a test IP is attached
+    #            the management IP is unusable, so NO ssh is used during a test.
+    #   ssh   -> this script configures the NIC over ssh (images where nothing does it).
+    "VM_CONFIG_MODE": "panel",
+    "NEW_IP_SETTLE_SEC": 45,          # panel mode: wait for the panel to configure the new IP
+    "DOWN_RETRY_WAIT_SEC": 60,        # panel mode: wait before re-checking an IP that looked DOWN
+    "MGMT_RETURN_WAIT_SEC": 90,       # panel mode: wait for management to answer after a release
     "MGMT_GUARD": True,
     "MGMT_GUARD_LIFE_SEC": 900,
     "SSH_RETRIES": 6,                 # extra attempts when an ssh command cannot connect
@@ -1204,7 +1213,12 @@ class Ssh:
     def __init__(self, cfg: Dict[str, Any], log: EventLog):
         self.cfg, self.log = cfg, log
         self.host = cfg["MANAGEMENT_IP"]
-        self.identity, self.pub_id, self.key_kind = resolve_ssh_identity(cfg)
+        try:
+            self.identity, self.pub_id, self.key_kind = resolve_ssh_identity(cfg)
+        except AgentError:
+            if str(cfg.get("VM_CONFIG_MODE")) != "panel":
+                raise
+            self.identity, self.pub_id, self.key_kind = None, None, "none"   # ssh is not used
 
     def base_cmd(self, multiplex: bool = True) -> List[str]:
         c = self.cfg
@@ -1599,6 +1613,9 @@ class Agent:
         self.ch = CheckHost(cfg, self.http, log)
         self.reach = Reachability(cfg, self.ch, log)
         self.state = State(cfg["MANAGEMENT_IP"])
+        if cfg["VM_CONFIG_MODE"] not in ("panel", "ssh"):
+            raise AgentError("vm_config_mode must be panel or ssh")
+        self.panel = cfg["VM_CONFIG_MODE"] == "panel"
 
     # ---------------------------------------------------------------- helpers --
     @staticmethod
@@ -1700,7 +1717,13 @@ class Agent:
         cfg["MANAGEMENT_PORT_ID"] = mine[0]["port_id"]
         print("server   : %s (%s) in %s" % (cfg["SERVER_NAME"], cfg["SERVER_ID"], cfg["REGION"]))
         print("mgmt IP  : %s on port %s" % (mgmt_ip, cfg["MANAGEMENT_PORT_ID"]))
-        # 2) VM side over SSH
+        # 2) VM side over SSH (ssh mode only; panel mode never logs in to the VM)
+        if self.panel:
+            _write_json_atomic(config_path(mgmt_ip), {k: cfg[k] for k in (
+                "REGION", "SERVER_ID", "SERVER_NAME", "MANAGEMENT_IP", "MANAGEMENT_PORT_ID")})
+            print("mode     : panel (ArvanCloud configures new IPs on the VM; no ssh is used)")
+            print("saved    : %s" % config_path(mgmt_ip))
+            return 0
         self.ssh.run("true")
         ai = self.ssh.addr_info(mgmt_ip)
         if ai:
@@ -1752,6 +1775,21 @@ class Agent:
                 row(True, "quotas read", "ok")
         except AgentError as exc:
             row(False, "arvan api", str(exc))
+        if self.panel:
+            row(True, "vm config mode", "panel: ArvanCloud configures new IPs on the VM, no ssh is used")
+        else:
+            self._preflight_ssh(row)
+        try:
+            probes = self.ch.probe_nodes()
+            row(len(probes) >= int(cfg["MIN_CONCLUSIVE_NODES"]), "check-host iran nodes",
+                "%d: %s" % (len(probes), ", ".join(p.split(".")[0] for p in probes)))
+        except AgentError as exc:
+            row(False, "check-host", str(exc))
+        print("\n%s" % ("all required checks passed" if not bad else "%d check(s) FAILED" % bad))
+        return 0 if not bad else 1
+
+    def _preflight_ssh(self, row: Callable[..., None]) -> None:
+        cfg = self.cfg
         ssh_ok = False
         try:
             self.ssh.run("true")
@@ -1805,18 +1843,10 @@ class Agent:
                 row(None, "mgmt route protection", "OFF")
         except SshError as exc:
             row(False, "ssh", str(exc))
-        try:
-            probes = self.ch.probe_nodes()
-            row(len(probes) >= int(cfg["MIN_CONCLUSIVE_NODES"]), "check-host iran nodes",
-                "%d: %s" % (len(probes), ", ".join(p.split(".")[0] for p in probes)))
-        except AgentError as exc:
-            row(False, "check-host", str(exc))
-        print("\n%s" % ("all required checks passed" if not bad else "%d check(s) FAILED" % bad))
-        return 0 if not bad else 1
 
     # ------------------------------------------------------------ mgmt route --
     def protect_mgmt(self) -> None:
-        if not self.cfg["PROTECT_MGMT_ROUTE"]:
+        if self.panel or not self.cfg["PROTECT_MGMT_ROUTE"]:
             return
         self.ssh.sudo_sh(self._mgmt_vars() + MGMT_PROTECT_SH)
         # confirm that a FRESH connection still reaches sshd and that the existing session
@@ -1837,13 +1867,13 @@ class Agent:
 
     def guard_beat(self) -> None:
         """Tell the guard on the VM that this computer is still running the test."""
-        if self.cfg["PROTECT_MGMT_ROUTE"] and self.cfg["MGMT_GUARD"]:
+        if not self.panel and self.cfg["PROTECT_MGMT_ROUTE"] and self.cfg["MGMT_GUARD"]:
             with contextlib.suppress(AgentError):
                 self.ssh.sudo_sh("[ -f /run/arvin-agent-badip/guard.alive ] && "
                                  "date +%s > /run/arvin-agent-badip/guard.alive || true")
 
     def unprotect_mgmt(self) -> None:
-        if self.cfg["PROTECT_MGMT_ROUTE"]:
+        if not self.panel and self.cfg["PROTECT_MGMT_ROUTE"]:
             with contextlib.suppress(AgentError):
                 self.ssh.sudo_sh(MGMT_GUARD_STOP_SH + self._mgmt_vars() + MGMT_UNPROTECT_SH)
                 self.log.info("mgmt_route_unpinned")
@@ -1860,6 +1890,8 @@ class Agent:
                            "before this round" % (ip, port_id))
         # OS side first (best effort; detaching the port removes the NIC anyway)
         with contextlib.suppress(AgentError):
+            if self.panel:
+                raise AgentError("panel mode: the panel removes the IP from the VM")
             self.ssh.sudo_sh(sh_vars(IP=ip, IF=pend.get("iface") or "", PLEN=pend.get("plen") or 32,
                                      T=pend.get("table") or self.cfg["POLICY_TABLE"]) + TESTIP_DOWN_SH)
         if any(x["port_id"] == port_id for x in self.api.public_inventory()):
@@ -1963,6 +1995,8 @@ class Agent:
             if rec["released"]:
                 self.state.data["pending"] = None
                 self.state.save()
+                if self.panel:
+                    rec["mgmt_back"] = self._mgmt_back()
         rec["finished_at"] = iso()
         vs = [c["verdict"] for c in rec["cycles"]]
         rec["regions_text"] = regions_text(rec.get("regions") or {})
@@ -2001,6 +2035,74 @@ class Agent:
         if not self._wait_for(listed, cfg["PORT_ACTIVE_TIMEOUT_SEC"], 5):
             raise AgentError("port %s is not listed with a MAC address after %ss"
                              % (pend["port_id"], cfg["PORT_ACTIVE_TIMEOUT_SEC"]))
+        if self.panel:
+            # the panel writes the netplan config and the route for the new IP by itself
+            settle = float(cfg["NEW_IP_SETTLE_SEC"])
+            self.log.info("waiting_for_panel", ip=ip, seconds=int(settle),
+                          note="the panel configures the IP on the VM; management is unusable meanwhile")
+            time.sleep(settle)
+        else:
+            self._ssh_configure(pend, rec, port)
+        # ---- informational: TCP from this Mac ----------------------------------------
+        if cfg["CHECK_TYPE"] in ("tcp", "http"):
+            try:
+                with socket.create_connection((ip, int(cfg["CHECK_PORT"])), timeout=5):
+                    rec["from_mac_tcp"] = True
+            except OSError:
+                rec["from_mac_tcp"] = False
+        # ---- 3) test from Iran ---------------------------------------------------------
+        for i in range(int(cfg["CHECKS_PER_IP"])):
+            self.guard_beat()
+            if i:
+                print("  waiting for the next check of %s (check-host allows one per %ss) ..."
+                      % (ip, cfg["CHECKHOST_MIN_SPACING_SEC"]), flush=True)
+            try:
+                res = self.reach.cycle(ip, "test-ip")
+            except InconclusiveError as exc:
+                res = {"verdict": INCONCLUSIVE, "why": str(exc)}
+            rec["cycles"].append({k: res.get(k) for k in ("verdict", "why", "ok", "fail", "unknown",
+                                                         "control_ok", "ok_ratio", "link")})
+            tot = rec.setdefault("regions", {})
+            for region, d in (res.get("by_region") or {}).items():
+                t = tot.setdefault(region, {"ok": 0, "fail": 0, "unknown": 0})
+                for k in ("ok", "fail", "unknown"):
+                    t[k] += int(d.get(k) or 0)
+            if res.get("link"):
+                rec["links"].append(res["link"])
+            if res.get("verdict") == DOWN:
+                # unreachable from every region: a server/network fault, not an Iran block
+                if self.panel:
+                    if i + 1 < int(cfg["CHECKS_PER_IP"]):      # maybe the panel is not done yet
+                        print("  %s is not answering from anywhere yet; waiting %ss before the next "
+                              "check ..." % (ip, cfg["DOWN_RETRY_WAIT_SEC"]), flush=True)
+                        time.sleep(float(cfg["DOWN_RETRY_WAIT_SEC"]))
+                    continue
+                self._diagnose_down(pend, rec)      # ssh mode: collect facts while the IP is up
+                break
+        if self.panel and rec["cycles"] and all(c["verdict"] == DOWN for c in rec["cycles"]):
+            self._diagnose_down(pend, rec)
+
+    def _mgmt_back(self) -> bool:
+        """Panel mode: after a release the panel restores the management route. Wait for
+        port SSH_PORT on the management IP to accept a connection again (a few probes only:
+        sshd penalises sources that connect often without logging in)."""
+        cfg = self.cfg
+        deadline = time.time() + float(cfg["MGMT_RETURN_WAIT_SEC"])
+        while True:
+            try:
+                with socket.create_connection((cfg["MANAGEMENT_IP"], int(cfg["SSH_PORT"])), timeout=8):
+                    self.log.info("management_back", ip=cfg["MANAGEMENT_IP"])
+                    return True
+            except OSError:
+                if time.time() >= deadline:
+                    self.log.warning("management_not_back_yet", ip=cfg["MANAGEMENT_IP"],
+                                     waited_sec=cfg["MGMT_RETURN_WAIT_SEC"])
+                    return False
+                time.sleep(20)
+
+    def _ssh_configure(self, pend: Dict[str, Any], rec: Dict[str, Any], port: Dict[str, Any]) -> None:
+        """ssh mode only: put the test IP on its NIC with source policy routing."""
+        cfg, ip = self.cfg, pend["ip"]
         pend["mac"] = pend.get("mac") or port["mac"]
         if not pend["mac"]:
             raise AgentError("unknown MAC for port %s" % pend["port_id"])
@@ -2042,37 +2144,6 @@ class Agent:
         rec["egress_ok"] = (eg == ip)
         if eg != ip:
             self.log.warning("egress_mismatch", ip=ip, seen=eg)
-        # ---- informational: TCP from this Mac ----------------------------------------
-        if cfg["CHECK_TYPE"] in ("tcp", "http"):
-            try:
-                with socket.create_connection((ip, int(cfg["CHECK_PORT"])), timeout=5):
-                    rec["from_mac_tcp"] = True
-            except OSError:
-                rec["from_mac_tcp"] = False
-        # ---- 3) test from Iran ---------------------------------------------------------
-        for i in range(int(cfg["CHECKS_PER_IP"])):
-            self.guard_beat()
-            if i:
-                print("  waiting for the next check of %s (check-host allows one per %ss) ..."
-                      % (ip, cfg["CHECKHOST_MIN_SPACING_SEC"]), flush=True)
-            try:
-                res = self.reach.cycle(ip, "test-ip")
-            except InconclusiveError as exc:
-                res = {"verdict": INCONCLUSIVE, "why": str(exc)}
-            rec["cycles"].append({k: res.get(k) for k in ("verdict", "why", "ok", "fail", "unknown",
-                                                         "control_ok", "ok_ratio", "link")})
-            tot = rec.setdefault("regions", {})
-            for region, d in (res.get("by_region") or {}).items():
-                t = tot.setdefault(region, {"ok": 0, "fail": 0, "unknown": 0})
-                for k in ("ok", "fail", "unknown"):
-                    t[k] += int(d.get(k) or 0)
-            if res.get("link"):
-                rec["links"].append(res["link"])
-            if res.get("verdict") == DOWN:
-                # unreachable from every region: a server/network fault, not an Iran block.
-                # Collect facts while the IP is still up; more cycles would say the same.
-                self._diagnose_down(pend, rec)
-                break
 
     def _diagnose_down(self, pend: Dict[str, Any], rec: Dict[str, Any]) -> None:
         cfg, ip = self.cfg, pend["ip"]
@@ -2080,6 +2151,8 @@ class Agent:
                % (ip, cfg["MANAGEMENT_IP"], pend.get("iface"), pend.get("cidr"), pend.get("gateway")),
                "tcp %s:%s from this computer: %s" % (ip, cfg["CHECK_PORT"], rec.get("from_mac_tcp")), ""]
         try:
+            if self.panel:
+                raise AgentError("panel mode: no ssh while a test IP is attached")
             p = self.ssh.sudo_sh(sh_vars(IF=pend.get("iface") or "", IP=ip, GW=pend.get("gateway") or "",
                                          T=pend.get("table"), PORT=cfg["CHECK_PORT"]) + TESTIP_DIAG_SH,
                                  check=False, timeout=90)
@@ -2121,7 +2194,8 @@ class Agent:
         seen = {r.get("ip") for r in load_results() if r.get("ip")}
         self.log.info("run_start", run_id=run_id, rounds=rounds, server=self.cfg["SERVER_ID"],
                       mgmt_ip=self.cfg["MANAGEMENT_IP"])
-        self.ssh.run("true")
+        if not self.panel:
+            self.ssh.run("true")
         if self.cfg["BASELINE_CHECK"]:
             with contextlib.suppress(InconclusiveError):
                 b = self.reach.cycle(self.cfg["MANAGEMENT_IP"], "baseline-mgmt")
@@ -2156,10 +2230,12 @@ class Agent:
         finally:
             self.unprotect_mgmt()
         print("\n" + summary_table(out))
+        save_state_file()
         if self.state.pending:
             print("\n!! an allocation is still pending: run `%s cleanup --yes`" % PROJECT)
             rc = rc or 2
-        print("results: %s" % os.path.join(HOME_DIR, "results.csv"))
+        print("results: %s  (table: `%s state`, file: %s)"
+              % (os.path.join(HOME_DIR, "results.csv"), PROJECT, os.path.join(HOME_DIR, "state.txt")))
         return rc
 
     def dry_run_report(self, rounds: int) -> int:
@@ -2168,14 +2244,18 @@ class Agent:
         inv = self.api.public_inventory()
         print("DRY RUN: nothing is allocated, configured or released.\n")
         print("server %s, public IPv4 now: %s" % (self.cfg["SERVER_ID"], ", ".join(x["ip"] for x in inv)))
-        if self.cfg["PROTECT_MGMT_ROUTE"]:
+        if not self.panel and self.cfg["PROTECT_MGMT_ROUTE"]:
             print("\nonce per run, in the VM as root (pins mgmt replies; %ss watchdog):\n%s"
                   % (self.cfg["MGMT_WATCHDOG_SEC"], self._mgmt_vars() + MGMT_PROTECT_SH))
         a, d = self.api.add_public_ip_preview(), self.api.detach_preview("<NEW_PORT_ID>")
         print("each of %d rounds:" % rounds)
         print("  1. %s %s (empty body)" % (a["method"], a["url"]))
-        print("  2. wait for the new port in GET /networks + its NIC (MAC) in the VM, then as root:")
-        print("     " + TESTIP_UP_SH.strip().replace("\n", "\n     "))
+        if self.panel:
+            print("  2. wait for the new port in GET /networks, then %ss for the panel to configure it "
+                  "on the VM (no ssh; management is unusable until step 4)" % self.cfg["NEW_IP_SETTLE_SEC"])
+        else:
+            print("  2. wait for the new port in GET /networks + its NIC (MAC) in the VM, then as root:")
+            print("     " + TESTIP_UP_SH.strip().replace("\n", "\n     "))
         print("  3. %d check-host %s cycle(s) to <NEW_IP>%s from: %s"
               % (int(self.cfg["CHECKS_PER_IP"]), self.cfg["CHECK_TYPE"],
                  "" if self.cfg["CHECK_TYPE"] == "ping" else ":%s" % self.cfg["CHECK_PORT"],
@@ -2259,6 +2339,15 @@ def state_table(rows: List[Dict[str, Any]]) -> str:
     lines.append("counts are reachable/tested nodes in that region for the latest test of the IP")
     lines.append("STATE comes from the Iran group only: GOOD = mostly reachable, BAD = mostly blocked")
     return "\n".join(lines)
+
+
+def save_state_file() -> str:
+    text = state_table(latest_per_ip(load_results()))
+    with contextlib.suppress(OSError):
+        os.makedirs(HOME_DIR, exist_ok=True)
+        with open(os.path.join(HOME_DIR, "state.txt"), "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    return text
 
 
 def summary_table(rows: List[Dict[str, Any]]) -> str:

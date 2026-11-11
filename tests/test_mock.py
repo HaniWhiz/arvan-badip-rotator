@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import arvin_agent_badip as m  # noqa: E402
 
 m.time.sleep = lambda s: None
+m.DEFAULTS["VM_CONFIG_MODE"] = "ssh"          # the ssh-mode tests come first; panel mode is last
 
 
 def _no_conn(*a, **k):
@@ -411,3 +412,32 @@ last = m.load_results()[-1]
 assert last["verdict"] == "UNTESTABLE" and len(last["cycles"]) == 1 and os.path.isfile(last["diag_file"]), last
 assert len(cloud["srv1"].detached) == nd + 1 and "ping gateway" in [s for _, _, s in scripts if s and "rp_filter" in s][-1]
 print("DIAG OK")
+
+# ---- panel mode (default): no ssh at all during init, preflight, test, cleanup ------------------
+m.DEFAULTS["VM_CONFIG_MODE"] = "panel"
+good = {"verdict": "REACHABLE", "why": "mock", "ok": 5, "fail": 0, "unknown": 0, "control_ok": 3,
+        "ok_ratio": 1.0, "link": "l", "by_region": {"iran": {"ok": 5, "fail": 0, "unknown": 0},
+                                                    "europe": {"ok": 3, "fail": 0, "unknown": 0}}}
+m.Reachability.cycle = lambda self, ip, purpose: dict(good)
+m.CheckHost.probe_nodes = lambda self: ["ir1", "ir2", "ir3"]
+m.socket.create_connection = lambda *a, **k: __import__("contextlib").nullcontext()
+C = yaml("management_ip: %s\nssh_key: ~/nope/missing_key\n" % S1)      # a bad ssh key must not matter
+n_ssh, nd = len(scripts), len(cloud["srv1"].detached)
+assert m.main(C + ["init"]) == 0
+assert m.main(C + ["preflight"]) == 0
+assert m.main(C + ["test", "--dry-run"]) == 0
+assert m.main(C + ["test", "--yes", "--rounds", "2"]) == 0
+assert len(scripts) == n_ssh, "panel mode must not use ssh"
+assert len(cloud["srv1"].detached) == nd + 2 and [p["id"] for p in cloud["srv1"].ports] == ["p-mgmt-srv1"]
+last = m.load_results()[-1]
+assert last["verdict"] == "GOOD" and last["mgmt_back"] is True and last["regions"]["europe"]["ok"] == 6, last
+assert os.path.isfile(os.path.join(home, "state.txt"))
+# all checks DOWN in panel mode: every cycle is run, then the IP is still released
+m.Reachability.cycle = lambda self, ip, purpose: {"verdict": "DOWN", "why": "mock", "ok": 0, "fail": 5,
+                                                  "unknown": 0, "control_ok": 0, "ok_ratio": 0.0, "link": "l",
+                                                  "by_region": {"iran": {"ok": 0, "fail": 5, "unknown": 0}}}
+assert m.main(C + ["test", "--yes", "--rounds", "1"]) == 0
+last = m.load_results()[-1]
+assert last["verdict"] == "UNTESTABLE" and len(last["cycles"]) == 2 and last["released"] is True, last
+assert len(scripts) == n_ssh
+print("PANEL OK")
