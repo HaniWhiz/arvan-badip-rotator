@@ -615,11 +615,39 @@ def _short_url(url: str) -> str:
     return "%s://%s%s" % (p.scheme, p.netloc, p.path)
 
 
+CA_FALLBACKS = ["/etc/ssl/cert.pem",                       # macOS, FreeBSD, Alpine
+                "/etc/ssl/certs/ca-certificates.crt",      # Debian/Ubuntu
+                "/etc/pki/tls/certs/ca-bundle.crt"]        # RHEL/Fedora
+
+
+def make_ssl_context() -> ssl.SSLContext:
+    """Verifying TLS context. Python from python.org on macOS ships without root
+    certificates ("CERTIFICATE_VERIFY_FAILED ... unable to get local issuer
+    certificate"), so when the default store is empty, load the system bundle
+    (or certifi if it is installed). Verification is never turned off."""
+    ctx = ssl.create_default_context()
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return ctx                                 # the user chose a bundle explicitly
+    with contextlib.suppress(Exception):
+        if ctx.cert_store_stats().get("x509_ca", 0) > 0:
+            return ctx
+    candidates = list(CA_FALLBACKS)
+    with contextlib.suppress(Exception):
+        import certifi  # type: ignore
+        candidates.insert(0, certifi.where())
+    for path in candidates:
+        if os.path.isfile(path):
+            with contextlib.suppress(ssl.SSLError, OSError):
+                ctx.load_verify_locations(cafile=path)
+                return ctx
+    return ctx
+
+
 class Http:
     def __init__(self, cfg: Dict[str, Any], log: EventLog, read_only: bool = False):
         self.cfg, self.log, self.read_only = cfg, log, read_only
         self._opener = urllib.request.build_opener(
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+            urllib.request.HTTPSHandler(context=make_ssl_context()))
         self.mutations: List[str] = []
         self._sunset_warned: set = set()
 
@@ -662,7 +690,11 @@ class Http:
                 if mutating and not idempotent:
                     raise AmbiguousRequestError("%s %s failed at network level (%s); it MAY have "
                                                 "been applied" % (method, _short_url(url), exc))
-                raise TransientError("%s %s network error: %s" % (method, _short_url(url), exc))
+                hint = ""
+                if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                    hint = (" | fix: run '/Applications/Python 3.x/Install Certificates.command' "
+                            "(python.org Python on macOS), or  export SSL_CERT_FILE=/etc/ssl/cert.pem")
+                raise TransientError("%s %s network error: %s%s" % (method, _short_url(url), exc, hint))
             for h in ("sunset", "deprecation"):
                 if h in rh and h not in self._sunset_warned:
                     self._sunset_warned.add(h)

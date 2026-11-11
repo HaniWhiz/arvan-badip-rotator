@@ -284,3 +284,8 @@ m.IS_WINDOWS = False
 assert m.main([]) == 1
 print("WINDOWS OK")
 print("ALL OK")
+
+# ---- TLS: empty default CA store falls back to a system bundle, still verifying ------------
+ctx = m.make_ssl_context()
+assert ctx.verify_mode == m.ssl.CERT_REQUIRED and ctx.check_hostname
+print("TLS OK")
