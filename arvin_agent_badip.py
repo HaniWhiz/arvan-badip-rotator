@@ -119,7 +119,15 @@ DEFAULTS: Dict[str, Any] = {
     "ROUNDS": 5,                      # how many test IPs per run
     "CHECKS_PER_IP": 2,               # check-host cycles per test IP
     "ROUND_SPACING_SEC": 60,          # pause between rounds
-    "BASELINE_CHECK": True,           # also probe the management IP once per run
+    "BASELINE_CHECK": False,          # off: the management IP is known good, never judged
+    # Every check is also run from these regions (check-host.net node country codes).
+    # The GOOD/BAD verdict uses the "iran" group only; the others are shown for comparison.
+    "PROBE_REGIONS": {"iran": ["ir"],
+                      "europe": ["de", "nl", "fr", "gb", "se", "fi", "pl", "ch", "at", "cz", "es", "it", "ro"],
+                      "usa": ["us"],
+                      "asia": ["sg", "jp", "hk", "in", "kr"],
+                      "other": ["au", "br", "za", "ca", "ae", "tr"]},
+    "PROBE_PER_REGION": 3,            # nodes per region in each check
     "MAX_PUBLIC_IPS_PER_SERVER": 4,   # Arvan per-server cap
 
     # ---- Policy routing for the test IP inside the VM ------------------------
@@ -510,7 +518,7 @@ class State:
 RESULT_FIELDS = ["finished_at", "server", "run_id", "round", "ip", "port_id", "verdict",
                  "reachable_cycles", "blocked_cycles", "down_cycles", "inconclusive_cycles",
                  "best_ok_ratio", "egress_ok", "from_mac_tcp", "seen_before",
-                 "released", "error", "links"]
+                 "released", "error", "regions_text", "links"]
 
 
 def append_result(rec: Dict[str, Any]) -> None:
@@ -985,6 +993,20 @@ class CheckHost:
             self.log.warning("checkhost_nodes_unavailable", error=str(exc))
         return list(self.cfg["PROBE_NODES_FALLBACK"])
 
+    def region_nodes(self, codes: List[str], per: int) -> List[str]:
+        """Up to `per` check-host nodes in each of the given country codes."""
+        try:
+            nodes = self.nodes()
+        except TransientError as exc:
+            self.log.warning("checkhost_nodes_unavailable", error=str(exc))
+            return []
+        out: List[str] = []
+        for cc in codes:
+            found = sorted(n for n, m in nodes.items()
+                           if str((m.get("location") or [""])[0]).lower() == cc.lower())
+            out += found[:per]
+        return out
+
     def control_nodes(self) -> List[str]:
         if self.cfg["CONTROL_NODES"]:
             return list(self.cfg["CONTROL_NODES"])
@@ -1061,13 +1083,29 @@ class Reachability:
         ctype = self.cfg["CHECK_TYPE"]
         if ctype not in ("tcp", "ping", "http"):
             raise AbortRun("CHECK_TYPE must be tcp, ping or http")
-        probes = self.ch.probe_nodes()
-        controls = [n for n in self.ch.control_nodes() if n not in probes]
-        raw, accepted, link = self.ch.run(ctype, self.target(ip), probes + controls)
+        probes = self.ch.probe_nodes()                       # the Iranian group
+        region_of: Dict[str, str] = {n: "iran" for n in probes}
+        per = int(self.cfg["PROBE_PER_REGION"])
+        for name, codes in (self.cfg.get("PROBE_REGIONS") or {}).items():
+            if name == "iran":
+                continue
+            for n in self.ch.region_nodes(list(codes), per):
+                region_of.setdefault(n, name)
+        others = [n for n, r in region_of.items() if r != "iran"]
+        if not others:                                       # no regional nodes: old control set
+            for n in self.ch.control_nodes():
+                if n not in probes:
+                    region_of[n] = "control"
+                    others.append(n)
+        raw, accepted, link = self.ch.run(ctype, self.target(ip), probes + others)
         per_node = {}
         for n in accepted:
             v, d = classify_node_result(ctype, raw.get(n))
-            per_node[n] = {"v": v, "d": d, "probe": n in probes}
+            per_node[n] = {"v": v, "d": d, "probe": n in probes, "region": region_of.get(n, "?")}
+        by_region: Dict[str, Dict[str, int]] = {}
+        for x in per_node.values():
+            b = by_region.setdefault(x["region"], {"ok": 0, "fail": 0, "unknown": 0})
+            b["ok" if x["v"] == "ok" else "fail" if x["v"] == "fail" else "unknown"] += 1
         ir = {k: x for k, x in per_node.items() if x["probe"]}
         ctl = {k: x for k, x in per_node.items() if not x["probe"]}
         ok = [n for n, x in ir.items() if x["v"] == "ok"]
@@ -1077,7 +1115,7 @@ class Reachability:
         ctl_concl = sum(1 for x in ctl.values() if x["v"] in ("ok", "fail"))
         res: Dict[str, Any] = {"purpose": purpose, "ip": ip, "type": ctype, "target": self.target(ip),
                                "link": link, "ok": len(ok), "fail": len(fail), "unknown": len(unknown),
-                               "control_ok": ctl_ok, "nodes": per_node}
+                               "control_ok": ctl_ok, "nodes": per_node, "by_region": by_region}
         min_c, thr = int(self.cfg["MIN_CONCLUSIVE_NODES"]), float(self.cfg["FAIL_RATIO_THRESHOLD"])
 
         def finish(verdict: str, why: str) -> Dict[str, Any]:
@@ -1798,6 +1836,7 @@ class Agent:
                 self.state.save()
         rec["finished_at"] = iso()
         vs = [c["verdict"] for c in rec["cycles"]]
+        rec["regions_text"] = regions_text(rec.get("regions") or {})
         rec.update(reachable_cycles=vs.count(REACHABLE), blocked_cycles=vs.count(BLOCKED),
                    down_cycles=vs.count(DOWN), inconclusive_cycles=vs.count(INCONCLUSIVE),
                    best_ok_ratio=max([c.get("ok_ratio") or 0 for c in rec["cycles"]] or [None]))
@@ -1884,6 +1923,11 @@ class Agent:
                 res = {"verdict": INCONCLUSIVE, "why": str(exc)}
             rec["cycles"].append({k: res.get(k) for k in ("verdict", "why", "ok", "fail", "unknown",
                                                          "control_ok", "ok_ratio", "link")})
+            tot = rec.setdefault("regions", {})
+            for region, d in (res.get("by_region") or {}).items():
+                t = tot.setdefault(region, {"ok": 0, "fail": 0, "unknown": 0})
+                for k in ("ok", "fail", "unknown"):
+                    t[k] += int(d.get(k) or 0)
             if res.get("link"):
                 rec["links"].append(res["link"])
 
@@ -1994,17 +2038,62 @@ class Agent:
         return 2
 
 
+REGION_ORDER = [("iran", "IR"), ("europe", "EU"), ("usa", "US"), ("asia", "ASIA"), ("other", "OTHER")]
+
+
+def regions_text(regions: Dict[str, Dict[str, int]]) -> str:
+    parts = []
+    for key, label in REGION_ORDER:
+        d = regions.get(key)
+        if d:
+            concl = int(d.get("ok", 0)) + int(d.get("fail", 0))
+            parts.append("%s %s/%s" % (label, d.get("ok", 0), concl))
+    return "  ".join(parts)
+
+
+def latest_per_ip(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The newest row for each (server, ip), ignoring rows without a tested IP."""
+    last: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in rows:
+        if r.get("ip") and r.get("round") != 0:
+            last[(r.get("server") or "", r["ip"])] = r
+    return sorted(last.values(), key=lambda r: (r.get("server") or "", r.get("ip") or ""))
+
+
+def state_table(rows: List[Dict[str, Any]]) -> str:
+    """One line per IP: the state, then each region's reachable count from the latest test."""
+    if not rows:
+        return "(no tested IPs yet)"
+    head = ["IP", "STATE", "IRAN", "EUROPE", "USA", "ASIA", "OTHER", "RELEASED", "LAST TEST"]
+    lines = ["%-16s %-13s %-8s %-9s %-8s %-8s %-8s %-10s %s" % tuple(head)]
+    for r in rows:
+        state = r.get("verdict") or "?"
+        if r.get("released") is False:
+            state += " (STILL ATTACHED)"
+        cells = []
+        regs = r.get("regions") or {}
+        for key, _label in REGION_ORDER:
+            d = regs.get(key)
+            cells.append("%s/%s" % (d["ok"], d["ok"] + d["fail"]) if d else "-")
+        lines.append("%-16s %-13s %-8s %-9s %-8s %-8s %-8s %-10s %s" % (
+            r["ip"], state, *cells, "yes" if r.get("released") else "no", r.get("finished_at") or ""))
+    lines.append("")
+    lines.append("counts are reachable/tested nodes in that region for the latest test of the IP")
+    lines.append("STATE comes from the Iran group only: GOOD = mostly reachable, BAD = mostly blocked")
+    return "\n".join(lines)
+
+
 def summary_table(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "(no results)"
     lines = ["%-20s %-16s %-5s %-16s %-12s %-5s %-6s %-8s %s" % (
-        "finished", "server", "round", "ip", "verdict", "r/b/d", "egress", "released", "first link")]
+        "finished", "server", "round", "ip", "verdict", "r/b/d", "egress", "released", "regions")]
     for r in rows:
         lines.append("%-20s %-16s %-5s %-16s %-12s %-5s %-6s %-8s %s" % (
             r.get("finished_at") or "", r.get("server") or "-", r.get("round"), r.get("ip") or "-", r.get("verdict"),
             "%s/%s/%s" % (r.get("reachable_cycles", "-"), r.get("blocked_cycles", "-"), r.get("down_cycles", "-")),
             {True: "ok", False: "BAD", None: "-"}.get(r.get("egress_ok"), "-"),
-            r.get("released"), (r.get("links") or [""])[0]))
+            r.get("released"), r.get("regions_text") or ""))
         if r.get("error"):
             lines.append("      error: %s" % r["error"])
     return "\n".join(lines)
@@ -2069,6 +2158,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--good", action="store_true", help="only GOOD IPs")
     p.add_argument("--last", type=int, default=0)
     sub.add_parser("status", help="show config and anything pending")
+    sub.add_parser("state", help="one line per IP: GOOD/BAD and the result from each region")
     sub.add_parser("inspect", help="read-only: save what the API returns for the server(s)")
     a = ap.parse_args(argv)
     a.server_id_check = bool(getattr(a, "server_id", None))
@@ -2092,7 +2182,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         ov["MANAGEMENT_IP"] = a.management_ip
     try:
         base = load_config(ov, a.config)
-        log = EventLog(base, quiet=a.cmd in ("results", "status"))
+        log = EventLog(base, quiet=a.cmd in ("results", "status", "state"))
+        if a.cmd == "state":
+            rows = latest_per_ip(load_results())
+            if a.server:
+                rows = [r for r in rows if r.get("server") in parse_ip_list(a.server)]
+            text = state_table(rows)
+            print(text)
+            with contextlib.suppress(OSError):
+                os.makedirs(HOME_DIR, exist_ok=True)
+                with open(os.path.join(HOME_DIR, "state.txt"), "w", encoding="utf-8") as fh:
+                    fh.write(text + "\n")
+                print("\nsaved: %s" % os.path.join(HOME_DIR, "state.txt"))
+            return 0
         if a.cmd == "results":
             rows = load_results()
             if a.bad:
