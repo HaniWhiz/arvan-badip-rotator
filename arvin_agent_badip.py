@@ -807,9 +807,25 @@ class ArvanAPI:
         return {"method": "POST", "url": self._r("/servers/%s/add-public-ip" % self.server_id),
                 "body": None}
 
-    def add_public_ip(self) -> Any:
-        """BILLABLE and NOT idempotent: sent exactly once per round."""
-        return self.call("POST", self.add_public_ip_preview()["url"], idempotent=False, empty_body=True)
+    def add_public_ip(self, body: Optional[Dict[str, Any]] = None) -> Any:
+        """BILLABLE and NOT idempotent: one request per call. body=None sends an empty body
+        (as the Terraform provider does); otherwise the given JSON body is sent."""
+        url = self.add_public_ip_preview()["url"]
+        resp = self.http.request("POST", url, headers=self._headers(), json_body=body,
+                                 idempotent=False, raw_body=None if body is not None else b"")
+        if 200 <= resp.status < 300:
+            return resp.json
+        raise ApiError("POST", url, resp.status,
+                       "%s | raw response: %s" % (_api_message(resp), resp.text[:400]),
+                       resp.headers.get("x-ar-request-id"))
+
+    def server_security_group_ids(self) -> List[str]:
+        out = []
+        for g in self.get_server().get("security_groups") or []:
+            gid = g.get("id") if isinstance(g, dict) else g
+            if gid:
+                out.append(str(gid))
+        return out
 
     def detach_preview(self, port_id: str) -> Dict[str, Any]:
         return {"method": "PATCH", "url": self._r("/networks/%s/detach" % port_id),
@@ -1695,7 +1711,7 @@ class Agent:
         self.log.info("allocate_request", round=n)
         data: Any = None
         try:
-            data = self.api.add_public_ip()
+            data = self._allocate_call()
         except AmbiguousRequestError as exc:
             self.log.warning("allocate_ambiguous", error=str(exc))
         except ApiError as exc:
@@ -1759,6 +1775,20 @@ class Agent:
         if rec.get("abort"):
             raise AbortRun(rec["error"])
         return rec
+
+    def _allocate_call(self) -> Any:
+        """Send add-public-ip. If ArvanCloud refuses it (not a transient error), a refusal
+        creates nothing, so try once more in the format the older API notes used:
+        {"type": "ipv4", "security_groups": [...]}. A transient error is not retried here."""
+        try:
+            return self.api.add_public_ip()
+        except ApiError as first:
+            if first.transient:
+                raise
+            sg = self.api.server_security_group_ids()
+            self.log.warning("allocate_refused_retrying_with_body", error=str(first),
+                             body={"type": self.cfg["IP_TYPE"], "security_groups": sg})
+            return self.api.add_public_ip({"type": self.cfg["IP_TYPE"], "security_groups": sg})
 
     def _configure_and_test(self, pend: Dict[str, Any], rec: Dict[str, Any]) -> None:
         cfg, ip = self.cfg, pend["ip"]

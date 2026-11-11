@@ -1,6 +1,7 @@
 """End-to-end test of arvin_agent_badip against a fake ArvanCloud API, fake VMs over a
 fake ssh, and a fake check-host. Run:  python3 tests/test_mock.py"""
 import itertools
+import types
 import json
 import os
 import subprocess
@@ -35,7 +36,7 @@ class FakeServer:
         s.fail_add = None
 
     def server(s):
-        return {"id": s.sid, "name": "vm-" + s.sid,
+        return {"id": s.sid, "name": "vm-" + s.sid, "security_groups": [{"id": "sg1"}],
                 "addresses": {"pub": [{"addr": ip, "is_public": True} for p in s.ports for ip in p["ips"]]}}
 
 
@@ -74,7 +75,9 @@ def fake_call(self, method, url, body=None, idempotent=None, allow_404=False, em
         if method == "GET" and len(parts) == 2:
             return c.server()
         if method == "POST" and parts[2] == "add-public-ip":
-            assert body is None and empty_body, "add-public-ip must be sent with an empty body"
+            if body is None:                         # like the real API: empty body refused
+                raise m.ApiError("POST", url, 422, "Bad Request", None)
+            assert body == {"type": "ipv4", "security_groups": ["sg1"]}, body
             k = next(c.n)
             c.ports.append({"id": "p-%s-%d" % (c.sid, k), "ips": ["%s.%d" % (c.net, k)],
                             "mac_address": "bb:%02d" % k})
@@ -95,6 +98,24 @@ def fake_call(self, method, url, body=None, idempotent=None, allow_404=False, em
 
 
 m.ArvanAPI.call = fake_call
+
+
+def _fake_http_request(self, method, url, headers=None, json_body=None, idempotent=None,
+                       retries=None, timeout=None, raw_body=None):
+    """add-public-ip goes straight through Http.request: route it to the same fake API."""
+    if method == "POST" and "/add-public-ip" in url:
+        body = json_body
+        try:
+            data = fake_call(types.SimpleNamespace(_key="k"), method, url, body=body, idempotent=False,
+                             empty_body=raw_body == b"")
+            return m.HttpResponse(200, {}, json.dumps({"data": data}).encode(), url)
+        except m.ApiError as exc:
+            return m.HttpResponse(exc.status, {}, b'{"message":"Bad Request"}', url)
+    return _orig_request(self, method, url, headers, json_body, idempotent, retries, timeout, raw_body)
+
+
+_orig_request = m.Http.request
+m.Http.request = _fake_http_request
 
 scripts = []
 ssh_cmds = []
