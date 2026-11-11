@@ -124,6 +124,7 @@ def fake_run(self, remote, stdin=None, check=True, timeout=60, multiplex=True):
 
 m.Ssh.run = fake_run
 m.Ssh.close_master = lambda self: None
+m.Ssh.fresh_ok = lambda self: True
 m.agent_keys = lambda: (True, ["ssh-ed25519 AAAAPUB"], "1 key")
 
 verd = itertools.cycle(["REACHABLE", "BLOCKED", "BLOCKED"])
@@ -303,3 +304,9 @@ print("ALL OK")
 ctx = m.make_ssl_context()
 assert ctx.verify_mode == m.ssl.CERT_REQUIRED and ctx.check_hostname
 print("TLS OK")
+
+# ---- SSH: normal commands reuse the master and never authenticate ---------------------------
+cs = m.server_config(m.load_config({}, None), S1, 0, 1)
+cmdl = m.Ssh(cs, m.EventLog(cs, quiet=True)).base_cmd()
+assert "ControlMaster=no" in cmdl and "BatchMode=yes" in cmdl and "ControlPath=/tmp/abip-%C" in cmdl
+print("SSH MASTER OK")

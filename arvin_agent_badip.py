@@ -102,6 +102,10 @@ DEFAULTS: Dict[str, Any] = {
     "SSH_KEY": "",
     "SSH_BIN": "ssh",
     "SSH_CONNECT_TIMEOUT": 10,
+    # macOS/Linux: one interactive login per server (ssh may ask for a passphrase,
+    # a PIN or a touch); every later command reuses that connection for this long.
+    "SSH_MASTER_PERSIST_SEC": 1800,
+    "SSH_LOGIN_TIMEOUT_SEC": 180,
     "SSH_EXTRA_OPTS": [],             # e.g. ["-o", "ProxyJump=bastion"]
     "SUDO": "sudo -n",                # "" if SSH_USER is root
 
@@ -1101,8 +1105,7 @@ class Ssh:
                "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
                "-o", "StrictHostKeyChecking=accept-new"]
         if multiplex and not IS_WINDOWS:     # Windows OpenSSH has no ControlMaster support
-            cmd += ["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/abip-%C",
-                    "-o", "ControlPersist=120"]
+            cmd += ["-o", "ControlMaster=no", "-o", "ControlPath=/tmp/abip-%C"]   # reuse the master only
         elif not IS_WINDOWS:
             cmd += ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
         if self.identity:
@@ -1111,8 +1114,70 @@ class Ssh:
         cmd += ["%s@%s" % (c["SSH_USER"], self.host)]
         return cmd
 
+    # ---- one interactive login, then a shared connection (macOS/Linux) ---------------
+    def master_alive(self) -> bool:
+        p = subprocess.run(self.base_cmd() + ["-O", "check"], capture_output=True, timeout=15)
+        return p.returncode == 0
+
+    def ensure_master(self) -> None:
+        """Log in ONCE with the terminal attached, so ssh can ask for a key passphrase,
+        a security-key PIN or a touch. All later commands reuse this connection and
+        never authenticate again. Not available on Windows (no ControlMaster there)."""
+        if IS_WINDOWS or self.master_alive():
+            return
+        c = self.cfg
+        target = "%s@%s" % (c["SSH_USER"], self.host)
+
+        def login(with_identity: bool) -> bool:
+            cmd = [c["SSH_BIN"], "-p", str(c["SSH_PORT"]),
+                   "-o", "ConnectTimeout=%d" % int(c["SSH_CONNECT_TIMEOUT"]),
+                   "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
+                   "-o", "StrictHostKeyChecking=accept-new",
+                   "-o", "ControlMaster=yes", "-o", "ControlPath=/tmp/abip-%C",
+                   "-o", "ControlPersist=%d" % int(c["SSH_MASTER_PERSIST_SEC"])]
+            if with_identity and self.identity:
+                cmd += ["-o", "IdentityFile=%s" % self.identity, "-o", "IdentitiesOnly=yes"]
+            cmd += list(c.get("SSH_EXTRA_OPTS") or []) + ["-f", "-N", target]
+            try:
+                p = subprocess.run(cmd, timeout=float(c["SSH_LOGIN_TIMEOUT_SEC"]))   # terminal attached
+            except subprocess.TimeoutExpired:
+                raise SshError("ssh login to %s was not completed within %ss"
+                               % (target, c["SSH_LOGIN_TIMEOUT_SEC"]))
+            return p.returncode == 0 and self.master_alive()
+
+        print("ssh login to %s (ssh may ask for a passphrase, a PIN or a touch) ..." % target, flush=True)
+        if login(True):
+            return
+        if self.identity:
+            print("login with ssh_key failed; trying again the way plain `ssh %s` does ..." % target,
+                  flush=True)
+            if login(False):
+                self.log.warning("ssh_key_not_used", detail="logged in with ssh's default keys instead; "
+                                                            "set ssh_key to \"\" in the YAML file")
+                return
+        raise SshError("ssh login to %s failed (see the ssh messages above). Check that "
+                       "`ssh %s` works by hand" % (target, target))
+
+    def fresh_ok(self) -> bool:
+        """Can a NEW connection reach sshd on the management IP? macOS/Linux: a plain TCP
+        connect that reads the SSH banner (no login, so no PIN prompt). Windows: a new ssh."""
+        if IS_WINDOWS:
+            try:
+                self.run("true", multiplex=False, timeout=30)
+                return True
+            except SshError:
+                return False
+        try:
+            with socket.create_connection((self.host, int(self.cfg["SSH_PORT"])), timeout=10) as sk:
+                sk.settimeout(10)
+                return sk.recv(64).startswith(b"SSH-")
+        except OSError:
+            return False
+
     def run(self, remote: str, stdin: Optional[str] = None, check: bool = True,
             timeout: float = 60, multiplex: bool = True) -> subprocess.CompletedProcess:
+        if multiplex:
+            self.ensure_master()
         cmd = self.base_cmd(multiplex) + ["--", remote]
         self.log.debug("ssh", remote=remote)
         try:
@@ -1496,7 +1561,7 @@ class Agent:
                     "%s %s" % ((self.ssh.pub_id or "?")[:40] + "...", "" if self.ssh.pub_id else
                                 "(cannot read the public key)"))
         try:
-            self.ssh.run("true", multiplex=False)
+            self.ssh.run("true")
             row(True, "ssh", "%s@%s:%s" % (cfg["SSH_USER"], cfg["MANAGEMENT_IP"], cfg["SSH_PORT"]))
             p = self.ssh.sudo_sh("id -u", check=False)
             row(p.returncode == 0 and p.stdout.strip() == "0", "passwordless sudo",
@@ -1535,9 +1600,12 @@ class Agent:
         if not self.cfg["PROTECT_MGMT_ROUTE"]:
             return
         self.ssh.sudo_sh(self._mgmt_vars() + MGMT_PROTECT_SH)
-        # confirm with a FRESH connection (not the multiplexed one), else the watchdog undoes it
+        # confirm that a FRESH connection still reaches sshd and that the existing session
+        # still works; otherwise the watchdog in the VM undoes the pin
         try:
-            self.ssh.run(("%s touch /run/arvin-agent-badip.mgmt-ok" % self.ssh.sudo_prefix()).strip(), multiplex=False,
+            if not self.ssh.fresh_ok():
+                raise SshError("a new connection to port %s got no SSH banner" % self.cfg["SSH_PORT"])
+            self.ssh.run(("%s touch /run/arvin-agent-badip.mgmt-ok" % self.ssh.sudo_prefix()).strip(),
                          timeout=30)
         except SshError as exc:
             raise AbortRun("management SSH failed after pinning the management route (%s); the VM "
@@ -1715,7 +1783,10 @@ class Agent:
                                  GW=gw, T=pend["table"], PR=cfg["POLICY_PRIORITY"]) + TESTIP_UP_SH)
         self.log.info("configured", ip=ip, iface=ifname, cidr=cidr, gateway=gw)
         # management must still be fine
-        self.ssh.run("true", multiplex=False, timeout=30)
+        if not self.ssh.fresh_ok():
+            raise AgentError("the management IP stopped accepting new SSH connections after the "
+                             "test IP was configured")
+        self.ssh.run("true", timeout=30)
         # ---- outbound from the test IP -------------------------------------------
         eg = self.ssh.egress_from(ip)
         rec["egress_ok"] = (eg == ip)
@@ -1752,7 +1823,7 @@ class Agent:
         seen = {r.get("ip") for r in load_results() if r.get("ip")}
         self.log.info("run_start", run_id=run_id, rounds=rounds, server=self.cfg["SERVER_ID"],
                       mgmt_ip=self.cfg["MANAGEMENT_IP"])
-        self.ssh.run("true", multiplex=False)
+        self.ssh.run("true")
         if self.cfg["BASELINE_CHECK"]:
             with contextlib.suppress(InconclusiveError):
                 b = self.reach.cycle(self.cfg["MANAGEMENT_IP"], "baseline-mgmt")
@@ -1785,7 +1856,6 @@ class Agent:
             rc = 4
         finally:
             self.unprotect_mgmt()
-            self.ssh.close_master()
         print("\n" + summary_table(out))
         if self.state.pending:
             print("\n!! an allocation is still pending: run `%s cleanup --yes`" % PROJECT)
