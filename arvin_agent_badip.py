@@ -380,6 +380,19 @@ def find_yaml(explicit: Optional[str]) -> Optional[str]:
     return None
 
 
+def parse_region_spec(text: str) -> Dict[str, List[str]]:
+    """'iran=ir; europe=de,nl; usa=us' -> {'iran': ['ir'], 'europe': ['de', 'nl'], 'usa': ['us']}"""
+    out: Dict[str, List[str]] = {}
+    for part in str(text).split(";"):
+        if not part.strip():
+            continue
+        if "=" not in part:
+            raise AgentError("probe_regions: expected name=codes, got %r" % part.strip())
+        name, codes = part.split("=", 1)
+        out[name.strip().lower()] = [c.strip().lower() for c in codes.split(",") if c.strip()]
+    return out
+
+
 def load_yaml_inputs(path: str) -> Dict[str, Any]:
     with open(path, encoding="utf-8") as fh:
         raw = parse_simple_yaml(fh.read(), path)
@@ -395,6 +408,9 @@ def load_yaml_inputs(path: str) -> Dict[str, Any]:
         if isinstance(v, list) and K in ("MANAGEMENT_IP", "SERVER_ID"):
             v = ",".join(str(x) for x in v)       # [ip1, ip2] works as well as "ip1, ip2"
         d = DEFAULTS[K]
+        if K == "PROBE_REGIONS" and isinstance(v, str):
+            out[K] = parse_region_spec(v)
+            continue
         if isinstance(d, bool):
             ok = isinstance(v, bool)
         elif isinstance(d, (int, float)):
