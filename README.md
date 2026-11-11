@@ -13,9 +13,9 @@ The management IP is never released, and neither is its port or any port that ex
 
 ## What one round does
 
-1. **Allocate:** `POST /servers/{id}/add-public-ip`, using the management port's security groups. This is billable. The pending allocation is written to `state.json` *before* the request is sent.
+1. **Allocate:** `POST /servers/{id}/add-public-ip` with an empty body. This is billable. The pending allocation is written to `state.json` *before* the request is sent. The reply carries no port details, so the new port is found by comparing the port list from `GET /networks` with the one saved before the request.
 2. **Configure (SSH + sudo):**
-   - It waits for the port to be ACTIVE and for its NIC (matched by MAC) to appear in the VM.
+   - It waits for the new port to show up in `GET /networks` with its MAC, and for its NIC (matched by MAC) to appear in the VM.
    - It adds the address and a source policy route (`from <test-ip> lookup 2100`).
    - It removes any DHCP default route that the hot-plugged NIC added to `main`.
    - Then it checks that `curl --interface <test-ip>` sees the test IP.
@@ -109,6 +109,7 @@ With a `.pub` key, ssh asks the agent for exactly that key (`IdentitiesOnly=yes`
 ./arvin_agent_badip.py results                # all results;  --bad / --good / --last N
 ./arvin_agent_badip.py --server 185.1.1.10 test --yes   # only one of the listed servers
 ./arvin_agent_badip.py status                 # saved config + anything pending
+./arvin_agent_badip.py inspect                # read-only: saves what the API returns for the server to servers/<ip>/inspect.json
 ./arvin_agent_badip.py cleanup --yes          # release a test IP left behind by a crash
 ```
 
@@ -139,7 +140,11 @@ This has **not** been run against the real ArvanCloud API. It passes a mock end-
 
 These assumptions are carried over from the earlier rotator work:
 
-- The v1 endpoints `add-public-ip` and `networks/{port_id}/detach` come from ArvanCloud's CLI and Terraform provider. They are not in the published v3 reference.
+- The v1 endpoints come from ArvanCloud's Terraform provider source (`arvancloud/terraform-provider-arvan`, last updated in 2023). They are not in the published v3 reference:
+  - `POST /servers/{id}/add-public-ip`, empty body
+  - `PATCH /networks/{port_id}/detach` with `{"server_id": …}`
+  - `GET /networks`, where `subnets[].servers[].ips[]` lists each port's IP, MAC and port ID
+- The provider only uses `detach` on ports it attached itself, so releasing a port made by `add-public-ip` this way is still unconfirmed. After every release the script checks that the management IP is still listed.
 - It's unknown whether detaching **frees the IPv4 and stops billing**. Check the panel and your billing after the first round.
 - The new IP is assumed to arrive as a **hot-plugged NIC**. If no NIC appears within 120 s, the round records an error and the IP is still released.
 - Pricing: each additional IPv4 is €2.83/month. It's unknown whether a few minutes are billed pro-rata.

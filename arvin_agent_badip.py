@@ -653,7 +653,8 @@ class Http:
 
     def request(self, method: str, url: str, headers: Optional[Dict[str, str]] = None,
                 json_body: Any = None, idempotent: Optional[bool] = None,
-                retries: Optional[int] = None, timeout: Optional[float] = None) -> HttpResponse:
+                retries: Optional[int] = None, timeout: Optional[float] = None,
+                raw_body: Optional[bytes] = None) -> HttpResponse:
         method = method.upper()
         mutating = method not in ("GET", "HEAD")
         if mutating and self.read_only:
@@ -665,6 +666,9 @@ class Http:
         data = None
         if json_body is not None:
             data = json.dumps(json_body).encode("utf-8")
+            hdrs["Content-Type"] = "application/json"
+        elif raw_body is not None:
+            data = raw_body
             hdrs["Content-Type"] = "application/json"
         n = int(self.cfg["HTTP_RETRIES"] if retries is None else retries)
         attempts = 1 + (n if idempotent else 0)
@@ -765,9 +769,9 @@ class ArvanAPI:
         return {"Authorization": self.cfg["API_KEY_PREFIX"] + self._key}
 
     def call(self, method: str, url: str, body: Any = None, idempotent: Optional[bool] = None,
-             allow_404: bool = False) -> Any:
+             allow_404: bool = False, empty_body: bool = False) -> Any:
         resp = self.http.request(method, url, headers=self._headers(), json_body=body,
-                                 idempotent=idempotent)
+                                 idempotent=idempotent, raw_body=b"" if empty_body else None)
         if 200 <= resp.status < 300:
             j = resp.json
             return j["data"] if isinstance(j, dict) and "data" in j else j
@@ -784,29 +788,24 @@ class ArvanAPI:
     def get_server(self) -> Dict[str, Any]:
         return self.call("GET", self._r("/servers/%s" % self.server_id)) or {}
 
-    def list_server_ports(self) -> List[Dict[str, Any]]:
-        return self.call("GET", self._r("/servers/%s/ports" % self.server_id)) or []
-
-    def get_port(self, port_id: str) -> Optional[Dict[str, Any]]:
-        return self.call("GET", self._r("/ports/%s" % port_id), allow_404=True)
-
-    def get_network(self, network_id: str) -> Optional[Dict[str, Any]]:
-        return self.call("GET", self._r("/networks/%s" % network_id), allow_404=True)
-
     def list_networks(self) -> List[Dict[str, Any]]:
         return self.call("GET", self._r("/networks")) or []
 
     def get_quotas(self) -> Any:
         return self.call("GET", self._r("/quotas"))
 
-    def add_public_ip_preview(self, sg: List[str]) -> Dict[str, Any]:
+    # Endpoints below are the ones ArvanCloud's own Terraform provider uses
+    # (github.com/arvancloud/terraform-provider-arvan, internal/api/iaas):
+    #   POST  /servers/{id}/add-public-ip          empty body, reply not used
+    #   PATCH /networks/{port_id}/detach           {"server_id": ...}
+    #   GET   /networks                            subnets[].servers[].ips[] = the ports
+    def add_public_ip_preview(self) -> Dict[str, Any]:
         return {"method": "POST", "url": self._r("/servers/%s/add-public-ip" % self.server_id),
-                "body": {"type": self.cfg["IP_TYPE"], "security_groups": list(sg)}}
+                "body": None}
 
-    def add_public_ip(self, sg: List[str]) -> Any:
+    def add_public_ip(self) -> Any:
         """BILLABLE and NOT idempotent: sent exactly once per round."""
-        p = self.add_public_ip_preview(sg)
-        return self.call("POST", p["url"], body=p["body"], idempotent=False)
+        return self.call("POST", self.add_public_ip_preview()["url"], idempotent=False, empty_body=True)
 
     def detach_preview(self, port_id: str) -> Dict[str, Any]:
         return {"method": "PATCH", "url": self._r("/networks/%s/detach" % port_id),
@@ -825,40 +824,38 @@ class ArvanAPI:
                     out.append(a["addr"])
         return out
 
-    def public_inventory(self) -> List[Dict[str, Any]]:
-        """[{ip, port_id, mac, network_id, sg_ids, status}] for the server's public IPv4s."""
-        server, ports = self.get_server(), self.list_server_ports()
-        flagged: Dict[str, bool] = {}
-        for _net, addrs in (server.get("addresses") or {}).items():
-            for a in addrs or []:
-                if _is_ipv4(a.get("addr")):
-                    flagged[a["addr"]] = bool(a.get("is_public"))
-        inv = []
-        for p in ports:
-            for ip in p.get("ips") or []:
-                if _is_ipv4(ip) and (flagged.get(ip) or (ip not in flagged and _is_public_ipv4(ip))):
-                    inv.append({"ip": ip, "port_id": p.get("id"),
-                                "mac": (p.get("mac_address") or "").lower(),
-                                "network_id": p.get("network_id"),
-                                "sg_ids": list(p.get("security_group_ids") or []),
-                                "status": p.get("status")})
-        return inv
+    def ports(self, networks: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+        """Every port of THIS server, from the networks listing:
+        [{ip, port_id, mac, public, float_ip, version, network_id, network_name, cidr, gateway}]."""
+        out: List[Dict[str, Any]] = []
+        for n in (networks if networks is not None else self.list_networks()):
+            for sn in n.get("subnets") or []:
+                for srv in sn.get("servers") or []:
+                    if srv.get("id") != self.server_id:
+                        continue
+                    for x in srv.get("ips") or []:
+                        ip = x.get("ip") or x.get("ip_address") or x.get("addr")
+                        if not ip:
+                            continue
+                        out.append({"ip": ip,
+                                    "port_id": x.get("port_id") or x.get("id"),
+                                    "mac": str(x.get("mac_address") or x.get("mac_addr") or "").lower(),
+                                    "public": x.get("public") if "public" in x else x.get("is_public"),
+                                    "float_ip": bool(x.get("float_ip")),
+                                    "version": str(x.get("version") or ""),
+                                    "network_id": n.get("id"), "network_name": n.get("name"),
+                                    "cidr": sn.get("cidr"), "gateway": sn.get("gateway_ip")})
+        return out
 
-    def subnet_for_ip(self, ip: str, network_id: Optional[str]) -> Optional[Dict[str, Any]]:
-        nets: List[Dict[str, Any]] = []
-        if network_id:
-            n = self.get_network(network_id)
-            if n:
-                nets.append(n)
-        if not nets:
-            nets = self.list_networks()
-        addr = ipaddress.ip_address(ip)
-        for n in nets:
-            for s in n.get("subnets") or []:
-                with contextlib.suppress(ValueError, TypeError):
-                    if addr in ipaddress.ip_network(s.get("cidr"), strict=False):
-                        return {"cidr": s.get("cidr"), "gateway": s.get("gateway_ip")}
-        return None
+    def public_inventory(self) -> List[Dict[str, Any]]:
+        """The server's public IPv4 ports (floating IPs are not ports, so they are left out)."""
+        inv = []
+        for x in self.ports():
+            if not _is_ipv4(x["ip"]) or x["float_ip"] or not x["port_id"]:
+                continue
+            if x["public"] is True or (x["public"] is None and _is_public_ipv4(x["ip"])):
+                inv.append(x)
+        return inv
 
 
 # =============================================================================
@@ -1364,13 +1361,8 @@ class Agent:
                        WD=c["MGMT_WATCHDOG_SEC"])
 
     # ------------------------------------------------------------------- init --
-    def init(self, mgmt_ip: str) -> int:
-        if not _is_ipv4(mgmt_ip):
-            raise AgentError("management IP %r is not an IPv4 address" % mgmt_ip)
+    def _find_server(self, mgmt_ip: str) -> None:
         cfg = self.cfg
-        cfg["MANAGEMENT_IP"] = mgmt_ip
-        self.ssh.host = mgmt_ip
-        # 1) panel side: which server and which port carries the management IP
         if not cfg.get("SERVER_ID"):
             matches = [s for s in self.api.list_servers() if mgmt_ip in ArvanAPI.server_ipv4s(s)]
             if len(matches) != 1:
@@ -1379,14 +1371,65 @@ class Agent:
             cfg["SERVER_ID"] = matches[0].get("id")
             cfg["SERVER_NAME"] = matches[0].get("name") or ""
         self.api.server_id = cfg["SERVER_ID"]
+
+    def inspect(self) -> int:
+        """Read-only: save what the API returns for this server, to debug field names."""
+        ip = self.cfg["MANAGEMENT_IP"]
+        self._find_server(ip)
+        srv, nets = self.api.get_server(), self.api.list_networks()
+        mine = []
+        for n in nets:                      # keep only this server's entries (others are not needed)
+            n2 = {k: v for k, v in n.items() if k != "subnets"}
+            n2["subnets"] = []
+            for sn in n.get("subnets") or []:
+                sv = [x for x in (sn.get("servers") or []) if x.get("id") == self.api.server_id]
+                if sv:
+                    sn2 = dict(sn)
+                    sn2["servers"] = sv
+                    n2["subnets"].append(sn2)
+            if n2["subnets"]:
+                mine.append(n2)
+        for k in ("password",):
+            srv.pop(k, None)
+        path = os.path.join(server_dir(ip), "inspect.json")
+        _write_json_atomic(path, {"server": srv, "networks_for_this_server": mine,
+                                  "network_count": len(nets),
+                                  "network_keys": sorted({k for n in nets for k in n}),
+                                  "subnet_keys": sorted({k for n in nets for sn in (n.get("subnets") or [])
+                                                         for k in sn})})
+        ports = self.api.ports(nets)
+        print("server %s (%s): %d network(s) listed, %d port(s) found for this server"
+              % (srv.get("name"), self.api.server_id, len(nets), len(ports)))
+        for x in ports:
+            print("  %-16s port=%s mac=%s public=%s float=%s subnet=%s gw=%s net=%s"
+                  % (x["ip"], x["port_id"], x["mac"] or "?", x["public"], x["float_ip"], x["cidr"],
+                     x["gateway"], x["network_name"]))
+        print("raw API data saved to %s" % path)
+        return 0
+
+    def init(self, mgmt_ip: str) -> int:
+        if not _is_ipv4(mgmt_ip):
+            raise AgentError("management IP %r is not an IPv4 address" % mgmt_ip)
+        cfg = self.cfg
+        cfg["MANAGEMENT_IP"] = mgmt_ip
+        self.ssh.host = mgmt_ip
+        # 1) panel side: which server and which port carries the management IP
+        self._find_server(mgmt_ip)
         srv = self.api.get_server()
         cfg["SERVER_NAME"] = srv.get("name") or cfg.get("SERVER_NAME") or ""
+        allp = self.api.ports()
         inv = self.api.public_inventory()
         mine = [x for x in inv if x["ip"] == mgmt_ip]
         if not mine:
-            raise AgentError("IP %s is not a public IPv4 of server %s (%s); public IPs: %s"
+            if not allp:
+                raise AgentError("the networks listing shows no ports for server %s (%s). Run `%s inspect` "
+                                 "and send the saved file so the field names can be matched"
+                                 % (cfg["SERVER_ID"], cfg["SERVER_NAME"], PROJECT))
+            raise AgentError("IP %s is not a public IPv4 port of server %s (%s); the API lists: %s. "
+                             "If it is a floating IP, use the server's own public IP instead"
                              % (mgmt_ip, cfg["SERVER_ID"], cfg["SERVER_NAME"],
-                                ", ".join(x["ip"] for x in inv) or "none"))
+                                ", ".join("%s%s" % (x["ip"], " (float)" if x["float_ip"] else "")
+                                          for x in allp)))
         cfg["MANAGEMENT_PORT_ID"] = mine[0]["port_id"]
         print("server   : %s (%s) in %s" % (cfg["SERVER_NAME"], cfg["SERVER_ID"], cfg["REGION"]))
         print("mgmt IP  : %s on port %s" % (mgmt_ip, cfg["MANAGEMENT_PORT_ID"]))
@@ -1434,8 +1477,9 @@ class Agent:
             row(bool(m), "management ip on port", cfg["MANAGEMENT_IP"] + " / " + cfg["MANAGEMENT_PORT_ID"])
             room = int(cfg["MAX_PUBLIC_IPS_PER_SERVER"]) - len(inv)
             row(room >= 1, "ip headroom", "%d public IPv4 now (%s); room for %d more" % (len(inv), ips, max(room, 0)))
-            if m and not m[0]["sg_ids"]:
-                row(None, "security groups", "mgmt port lists none; Arvan's default group will apply")
+            if m:
+                row(bool(m[0]["mac"] and m[0]["cidr"] and m[0]["gateway"]), "port details from api",
+                    "mac=%s subnet=%s gw=%s" % (m[0]["mac"] or "?", m[0]["cidr"] or "?", m[0]["gateway"] or "?"))
             with contextlib.suppress(Exception):
                 self.api.get_quotas()
                 row(True, "quotas read", "ok")
@@ -1557,16 +1601,16 @@ class Agent:
         if len(inv) >= int(cfg["MAX_PUBLIC_IPS_PER_SERVER"]):
             raise AbortRun("server already has %d public IPv4 (cap %s); release extras in the panel"
                            % (len(inv), cfg["MAX_PUBLIC_IPS_PER_SERVER"]))
-        ports_before = [p.get("id") for p in self.api.list_server_ports()]
+        ports_before = sorted({p["port_id"] for p in self.api.ports() if p["port_id"]})
         pend: Dict[str, Any] = {"run_id": run_id, "round": n, "ports_before": ports_before,
                                 "add_sent_at": iso(), "table": int(cfg["POLICY_TABLE"])}
         self.state.data["pending"] = pend
         self.state.save()                                   # write-ahead before the billable POST
         # ---- 1) allocate --------------------------------------------------------
-        self.log.info("allocate_request", round=n, security_groups=mg[0]["sg_ids"])
+        self.log.info("allocate_request", round=n)
         data: Any = None
         try:
-            data = self.api.add_public_ip(mg[0]["sg_ids"])
+            data = self.api.add_public_ip()
         except AmbiguousRequestError as exc:
             self.log.warning("allocate_ambiguous", error=str(exc))
         except ApiError as exc:
@@ -1636,18 +1680,15 @@ class Agent:
         # ---- 2) wait for the port and the NIC; configure it inside the VM ------
         port: Dict[str, Any] = {}
 
-        def active() -> bool:
+        def listed() -> bool:
             nonlocal port
-            port = self.api.get_port(pend["port_id"]) or next(
-                (x for x in self.api.list_server_ports() if x.get("id") == pend["port_id"]), {})
-            if not port:
-                raise AgentError("new port %s disappeared" % pend["port_id"])
-            return str(port.get("status") or "ACTIVE").upper() == "ACTIVE"
+            port = next((x for x in self.api.ports() if x["port_id"] == pend["port_id"]), {})
+            return bool(port and port.get("mac"))
 
-        if not self._wait_for(active, cfg["PORT_ACTIVE_TIMEOUT_SEC"], 5):
-            raise AgentError("port %s not ACTIVE after %ss (status=%s)"
-                             % (pend["port_id"], cfg["PORT_ACTIVE_TIMEOUT_SEC"], port.get("status")))
-        pend["mac"] = pend.get("mac") or str(port.get("mac_address") or "").lower()
+        if not self._wait_for(listed, cfg["PORT_ACTIVE_TIMEOUT_SEC"], 5):
+            raise AgentError("port %s is not listed with a MAC address after %ss"
+                             % (pend["port_id"], cfg["PORT_ACTIVE_TIMEOUT_SEC"]))
+        pend["mac"] = pend.get("mac") or port["mac"]
         if not pend["mac"]:
             raise AgentError("unknown MAC for port %s" % pend["port_id"])
         ifname = self._wait_for(lambda: self.ssh.iface_for_mac(pend["mac"]), cfg["NIC_APPEAR_TIMEOUT_SEC"])
@@ -1657,8 +1698,10 @@ class Agent:
         if ifname == cfg["MANAGEMENT_IFACE"]:
             raise AbortRun("new port's MAC maps to the management interface %s; refusing" % ifname)
         pend["iface"] = ifname
-        sn = self.api.subnet_for_ip(ip, port.get("network_id"))
-        cidr, gw = (sn or {}).get("cidr"), (sn or {}).get("gateway")
+        cidr, gw = port.get("cidr"), port.get("gateway")
+        with contextlib.suppress(ValueError, TypeError):
+            if cidr and ipaddress.ip_address(ip) not in ipaddress.ip_network(cidr, strict=False):
+                cidr = gw = None                    # listing does not match this IP: use the NIC
         if not (cidr and gw):           # fallback: what DHCP put on the NIC
             ai = self.ssh.addr_info(ip)
             gw = gw or self.ssh.gateway_on(ifname)
@@ -1754,17 +1797,15 @@ class Agent:
         self._require_init()
         self.api.server_id = self.cfg["SERVER_ID"]
         inv = self.api.public_inventory()
-        mg = [x for x in inv if x["port_id"] == self.cfg["MANAGEMENT_PORT_ID"]]
-        sg = mg[0]["sg_ids"] if mg else []
         print("DRY RUN: nothing is allocated, configured or released.\n")
         print("server %s, public IPv4 now: %s" % (self.cfg["SERVER_ID"], ", ".join(x["ip"] for x in inv)))
         if self.cfg["PROTECT_MGMT_ROUTE"]:
             print("\nonce per run, in the VM as root (pins mgmt replies; %ss watchdog):\n%s"
                   % (self.cfg["MGMT_WATCHDOG_SEC"], self._mgmt_vars() + MGMT_PROTECT_SH))
-        a, d = self.api.add_public_ip_preview(sg), self.api.detach_preview("<NEW_PORT_ID>")
+        a, d = self.api.add_public_ip_preview(), self.api.detach_preview("<NEW_PORT_ID>")
         print("each of %d rounds:" % rounds)
-        print("  1. %s %s %s" % (a["method"], a["url"], json.dumps(a["body"])))
-        print("  2. wait for the port ACTIVE + NIC (MAC) in the VM, then as root:")
+        print("  1. %s %s (empty body)" % (a["method"], a["url"]))
+        print("  2. wait for the new port in GET /networks + its NIC (MAC) in the VM, then as root:")
         print("     " + TESTIP_UP_SH.strip().replace("\n", "\n     "))
         print("  3. %d check-host %s cycle(s) to <NEW_IP>%s from: %s"
               % (int(self.cfg["CHECKS_PER_IP"]), self.cfg["CHECK_TYPE"],
@@ -1881,6 +1922,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--good", action="store_true", help="only GOOD IPs")
     p.add_argument("--last", type=int, default=0)
     sub.add_parser("status", help="show config and anything pending")
+    sub.add_parser("inspect", help="read-only: save what the API returns for the server(s)")
     a = ap.parse_args(argv)
     a.server_id_check = bool(getattr(a, "server_id", None))
     for name in ("server_id", "management_ip", "rounds", "checks_per_ip", "check_type", "check_port",
@@ -1962,6 +2004,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 agent = Agent(c, log, dry_run=(a.cmd == "test" and a.dry_run))
                 if a.cmd == "init":
                     r = agent.init(c["MANAGEMENT_IP"])
+                elif a.cmd == "inspect":
+                    r = agent.inspect()
                 elif a.cmd == "preflight":
                     r = agent.preflight()
                 elif a.cmd == "cleanup":
