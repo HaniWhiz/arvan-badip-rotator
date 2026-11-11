@@ -44,37 +44,47 @@ by_ip = {c.mgmt: c for c in cloud.values()}
 keys_seen = []
 
 
-def fake_call(self, method, url, body=None, idempotent=None, allow_404=False):
+def fake_networks():
+    """Same shape as the Terraform provider's NetworkDetails: subnets[].servers[].ips[]."""
+    nets = []
+    for c in cloud.values():
+        nets.append({"id": "n-" + c.sid, "name": "public-" + c.sid, "subnets": [{
+            "id": "sub-" + c.sid, "cidr": c.net + ".0/24", "gateway_ip": c.net + ".1",
+            "servers": [{"id": c.sid, "name": "vm-" + c.sid,
+                         "ips": [{"ip": p["ips"][0], "mac_address": p["mac_address"], "port_id": p["id"],
+                                  "public": True, "float_ip": False, "version": "4",
+                                  "subnet_id": "sub-" + c.sid} for p in c.ports]},
+                        {"id": "someone-else", "ips": [{"ip": c.net + ".99", "port_id": "p-other",
+                                                        "mac_address": "ff:ff", "public": True}]}]}]})
+    return nets
+
+
+def fake_call(self, method, url, body=None, idempotent=None, allow_404=False, empty_body=False):
     keys_seen.append(self._key)
     path = url.split("/regions/ir-thr-ba1")[1]
     parts = path.strip("/").split("/")
     if method == "GET" and path == "/servers":
         return [c.server() for c in cloud.values()]
+    if method == "GET" and path == "/networks":
+        return fake_networks()
+    if method == "GET" and path == "/quotas":
+        return {}
     if parts[0] == "servers":
         c = cloud[parts[1]]
         if method == "GET" and len(parts) == 2:
             return c.server()
-        if method == "GET" and parts[2] == "ports":
-            return [dict(p) for p in c.ports]
         if method == "POST" and parts[2] == "add-public-ip":
-            assert body["security_groups"] == ["sg1"]
+            assert body is None and empty_body, "add-public-ip must be sent with an empty body"
             k = next(c.n)
-            p = {"id": "p-%s-%d" % (c.sid, k), "ips": ["%s.%d" % (c.net, k)], "mac_address": "bb:%02d" % k,
-                 "network_id": "n-" + c.sid, "security_group_ids": ["sg1"], "status": "ACTIVE"}
-            c.ports.append(p)
+            c.ports.append({"id": "p-%s-%d" % (c.sid, k), "ips": ["%s.%d" % (c.net, k)],
+                            "mac_address": "bb:%02d" % k})
             if c.fail_add == "lost":
                 raise m.AmbiguousRequestError("lost")
-            return {"port_id": p["id"], "mac_addr": p["mac_address"], "fixed_ips": [{"ip_address": p["ips"][0]}]}
-    if method == "GET" and parts[0] == "ports":
-        return next((p for c in cloud.values() for p in c.ports if p["id"] == parts[1]), None)
-    if method == "GET" and parts[0] == "networks":
-        c = cloud[parts[1][2:]]
-        return {"id": parts[1], "subnets": [{"cidr": c.net + ".0/24", "gateway_ip": c.net + ".1"}]}
-    if method == "GET" and path == "/quotas":
-        return {}
+            return None                              # the real reply carries no port details
     if method == "PATCH" and parts[0] == "networks" and parts[2] == "detach":
         pid = parts[1]
         assert not pid.startswith("p-mgmt"), "tried to release the management port!"
+        assert pid != "p-other", "tried to release another server's port!"
         for c in cloud.values():
             if any(p["id"] == pid for p in c.ports):
                 assert body["server_id"] == c.sid
@@ -145,6 +155,10 @@ assert m.main(C + ["init"]) == 0
 cfg = json.load(open(m.config_path(S1)))
 assert cfg["MANAGEMENT_PORT_ID"] == "p-mgmt-srv1" and cfg["MANAGEMENT_GATEWAY"] == "185.1.1.1", cfg
 assert m.main(C + ["preflight"]) == 0
+assert m.main(C + ["inspect"]) == 0
+insp = json.load(open(os.path.join(m.server_dir(S1), "inspect.json")))
+assert insp["networks_for_this_server"][0]["subnets"][0]["servers"][0]["id"] == "srv1"
+assert "someone-else" not in json.dumps(insp)
 assert m.main(C + ["test", "--dry-run"]) == 0
 assert m.main(C + ["test", "--yes"]) == 0
 c1 = cloud["srv1"]
