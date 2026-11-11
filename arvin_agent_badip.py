@@ -1259,19 +1259,18 @@ class Ssh:
                        "`ssh %s` works by hand" % (target, target))
 
     def fresh_ok(self) -> bool:
-        """Can a NEW connection reach sshd on the management IP? macOS/Linux: a plain TCP
-        connect that reads the SSH banner (no login, so no PIN prompt). Windows: a new ssh."""
-        if IS_WINDOWS:
-            try:
-                self.run("true", multiplex=False, timeout=30)
-                return True
-            except SshError:
-                return False
+        """Is the management path still healthy?
+
+        macOS/Linux: run a command over the already-open connection. Routing changes on
+        the VM apply to every packet from the management IP, so this tests the same
+        path as a new connection would. A bare TCP probe of port 22 is NOT used:
+        sshd (OpenSSH 9.8+, PerSourcePenalties) penalises clients that connect without
+        authenticating and then refuses them, which made the probe itself fail.
+        Windows (no shared connection): a new, authenticated ssh."""
         try:
-            with socket.create_connection((self.host, int(self.cfg["SSH_PORT"])), timeout=10) as sk:
-                sk.settimeout(10)
-                return sk.recv(64).startswith(b"SSH-")
-        except OSError:
+            self.run("true", multiplex=not IS_WINDOWS, timeout=30)
+            return True
+        except SshError:
             return False
 
     def run(self, remote: str, stdin: Optional[str] = None, check: bool = True,
@@ -1747,7 +1746,7 @@ class Agent:
         # still works; otherwise the watchdog in the VM undoes the pin
         try:
             if not self.ssh.fresh_ok():
-                raise SshError("a new connection to port %s got no SSH banner" % self.cfg["SSH_PORT"])
+                raise SshError("the ssh session stopped answering")
             self.ssh.run(("%s touch /run/arvin-agent-badip.mgmt-ok" % self.ssh.sudo_prefix()).strip(),
                          timeout=30)
         except SshError as exc:
