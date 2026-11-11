@@ -70,12 +70,14 @@ def fake_call(self, method, url, body=None, idempotent=None, allow_404=False, em
         return fake_networks()
     if method == "GET" and path == "/quotas":
         return {}
+    if method == "GET" and path == "/securities":
+        return [{"id": "sg1", "name": "Default"}, {"id": "sg2", "name": "allow-any"}]
     if parts[0] == "servers":
         c = cloud[parts[1]]
         if method == "GET" and len(parts) == 2:
             return c.server()
         if method == "POST" and parts[2] == "add-public-ip":
-            if body is None:                         # like the real API: empty body refused
+            if body is None or not body.get("security_groups"):   # no firewall: refused, like the API
                 raise m.ApiError("POST", url, 422, "Bad Request", None)
             assert body == {"type": "ipv4", "security_groups": ["sg1"]}, body
             k = next(c.n)
@@ -341,3 +343,17 @@ cs = m.server_config(m.load_config({}, None), S1, 0, 1)
 cmdl = m.Ssh(cs, m.EventLog(cs, quiet=True)).base_cmd()
 assert "ControlMaster=no" in cmdl and "BatchMode=yes" in cmdl and "ControlPath=/tmp/abip-%C" in cmdl
 print("SSH MASTER OK")
+
+# ---- firewall by name ------------------------------------------------------------------------
+cfw = m.server_config(m.load_config({}, None), S1, 0, 1)
+apifw = m.ArvanAPI(cfw, m.Http(cfw, m.EventLog(cfw, quiet=True)), "k")
+apifw.server_id = "srv1"
+assert apifw.firewall_for_new_ip() == ["sg1"]                     # "Default" by name
+cfw["FIREWALL_NAME"] = "allow-any"; assert apifw.firewall_for_new_ip() == ["sg2"]
+cfw["FIREWALL_NAME"] = ""; cfw["FIREWALL_ID"] = "sg9"; assert apifw.firewall_for_new_ip() == ["sg9"]
+cfw["FIREWALL_ID"] = ""; cfw["FIREWALL_NAME"] = "nope"
+try:
+    apifw.firewall_for_new_ip(); raise SystemExit("accepted unknown firewall name")
+except m.AbortRun as e:
+    print("rejected:", str(e)[:80])
+print("FIREWALL OK")
