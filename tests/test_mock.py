@@ -160,6 +160,7 @@ def fake_cycle(self, ip, purpose):
             "link": "https://check-host.net/check-report/x"}
 
 
+ORIG_CYCLE, ORIG_PROBE = m.Reachability.cycle, m.CheckHost.probe_nodes
 m.Reachability.cycle = fake_cycle
 m.CheckHost.probe_nodes = lambda self: ["ir1", "ir2", "ir3"]
 
@@ -188,7 +189,7 @@ assert m.main(C + ["test", "--yes"]) == 0
 c1 = cloud["srv1"]
 assert len(c1.detached) == 5 and [p["id"] for p in c1.ports] == ["p-mgmt-srv1"], c1.detached
 rows = m.load_results()
-assert len(rows) == 6 and all(r["server"] == S1 for r in rows), rows
+assert len(rows) == 5 and all(r["server"] == S1 for r in rows), rows
 assert any(s and 'ip rule add from "$MIP/32"' in s for _, _, s in scripts)
 assert any(s and 'ip rule del from "$MIP/32"' in s for _, _, s in scripts)
 # ssh used the inline public key through a written .pub file
@@ -357,3 +358,44 @@ try:
 except m.AbortRun as e:
     print("rejected:", str(e)[:80])
 print("FIREWALL OK")
+
+# ---- regions, state table ---------------------------------------------------------------------
+regs = {"iran": {"ok": 3, "fail": 0, "unknown": 0}, "europe": {"ok": 2, "fail": 1, "unknown": 0}}
+assert m.regions_text(regs) == "IR 3/3  EU 2/3", m.regions_text(regs)
+rows_s = [{"server": S1, "ip": "1.1.1.1", "round": 1, "verdict": "BAD", "regions": regs,
+           "released": True, "finished_at": "t1"},
+          {"server": S1, "ip": "1.1.1.1", "round": 2, "verdict": "GOOD", "regions": regs,
+           "released": True, "finished_at": "t2"},
+          {"server": S1, "ip": "2.2.2.2", "round": 1, "verdict": "BAD", "regions": {},
+           "released": False, "finished_at": "t3"},
+          {"server": S1, "ip": S1, "round": 0, "verdict": "MGMT-GOOD"}]
+latest = m.latest_per_ip(rows_s)
+assert [r["ip"] for r in latest] == ["1.1.1.1", "2.2.2.2"] and latest[0]["verdict"] == "GOOD"
+st = m.state_table(latest)
+assert "STILL ATTACHED" in st and "3/3" in st and S1 not in st.split("\n")[1], st
+print("STATE OK")
+
+# ---- one check reaches every region; the verdict uses Iran only -------------------------------
+fake_nodes = {"ir1.node": {"location": ["ir"]}, "ir2.node": {"location": ["ir"]}, "ir3.node": {"location": ["ir"]},
+              "de1.node": {"location": ["de"]}, "us1.node": {"location": ["us"]}, "sg1.node": {"location": ["sg"]}}
+m.Reachability.cycle, m.CheckHost.probe_nodes = ORIG_CYCLE, ORIG_PROBE
+cr = m.server_config(m.load_config({}, None), S1, 0, 1)
+cr.update(PROBE_NODES=[], CONTROL_NODES=[], IRAN_CONTROL_TARGET="", CHECK_TYPE="tcp")
+logr = m.EventLog(cr, quiet=True)
+chr_ = m.CheckHost(cr, m.Http(cr, logr), logr)
+chr_.nodes = lambda: fake_nodes
+seen_nodes = []
+def fake_run(self, ctype, host, nodes):
+    seen_nodes.extend(nodes)
+    raw = {n: [{"time": 0.1, "address": "x"}] for n in nodes}
+    raw["de1.node"] = [{"error": "timeout"}]              # Europe fails
+    return raw, nodes, "https://check-host.net/check-report/y"
+m.CheckHost.run = fake_run
+m.CheckHost.submit = None
+reach = m.Reachability(cr, chr_, logr)
+res = reach.cycle(S1, "test")
+assert set(seen_nodes) == {"ir1.node", "ir2.node", "ir3.node", "de1.node", "us1.node", "sg1.node"}, seen_nodes
+assert res["by_region"]["iran"] == {"ok": 3, "fail": 0, "unknown": 0}, res["by_region"]
+assert res["by_region"]["europe"] == {"ok": 0, "fail": 1, "unknown": 0}, res["by_region"]
+assert res["verdict"] == "REACHABLE", res["verdict"]           # Iran only decides
+print("REGIONS OK")

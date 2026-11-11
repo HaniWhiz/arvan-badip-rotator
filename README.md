@@ -103,6 +103,18 @@ With a `.pub` key, ssh asks the agent for exactly that key (`IdentitiesOnly=yes`
 
 **SSH login:** on macOS the script logs in to each server once with the terminal attached, so ssh can ask for a key passphrase, a security-key PIN or a touch. Every later command reuses that connection (for up to 30 minutes, `ssh_master_persist_sec`) and never authenticates again. If the login with `ssh_key` fails, it retries the way plain `ssh hani@<ip>` does.
 
+## Results at a glance
+
+Every check runs from several regions at once. The GOOD/BAD verdict comes from the **Iran** group only. Europe, USA, Asia and other regions are shown for comparison. The management IP is not tested or judged; it is only used to reach the server.
+
+```sh
+python3 arvin_agent_badip.py state     # one line per IP: STATE, then IRAN / EUROPE / USA / ASIA / OTHER counts
+```
+
+`state` is also saved to `~/arvin-agent-badip/state.txt`, so you can open it at any time. A counts column such as `EUROPE 2/3` means 2 of 3 European nodes reached the IP. `(STILL ATTACHED)` means the IP is still on the server and needs removing in the panel.
+
+Regions are set by `probe_regions` in the YAML file (check-host node country codes). `probe_per_region` sets how many nodes each region uses.
+
 ## Use
 
 ```sh
@@ -110,6 +122,7 @@ With a `.pub` key, ssh asks the agent for exactly that key (`IdentitiesOnly=yes`
 ./arvin_agent_badip.py test --dry-run         # prints every API request and VM script; makes 0 changes
 ./arvin_agent_badip.py test --rounds 1 --yes  # one billable round first
 ./arvin_agent_badip.py test --yes             # 5 rounds
+./arvin_agent_badip.py state                  # latest GOOD/BAD per IP, with each region
 ./arvin_agent_badip.py results                # all results;  --bad / --good / --last N
 ./arvin_agent_badip.py --server 185.1.1.10 test --yes   # only one of the listed servers
 ./arvin_agent_badip.py status                 # saved config + anything pending

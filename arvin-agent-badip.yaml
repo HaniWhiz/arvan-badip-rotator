@@ -63,7 +63,12 @@ ssh_extra_opts: []                # e.g. ["-o", "ProxyJump=bastion.example"]
 rounds: 5                         # how many test IPs per run (allocate -> test -> release)
 checks_per_ip: 2                  # check-host cycles per test IP
 round_spacing_sec: 60             # pause between rounds
-baseline_check: true              # also probe the management IP once per run
+baseline_check: false             # off: the management IP is known good and is not judged
+
+# Regions tested on every check (check-host.net node country codes). The verdict uses "iran" only.
+# one line: region=country codes, regions separated by ";"
+probe_regions: "iran=ir; europe=de,nl,fr,gb,se,fi,pl,ch,at,cz,es,it,ro; usa=us; asia=sg,jp,hk,in,kr; other=au,br,za,ca,ae,tr"
+probe_per_region: 3
 
 # How "reachable from Iran" is tested (sshd already listens on 0.0.0.0:22).
 check_type: tcp                   # tcp | ping | http
