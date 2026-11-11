@@ -96,6 +96,15 @@ DEFAULTS: Dict[str, Any] = {
     "MGMT_TABLE": 2099,
     "MGMT_PRIORITY": 20999,
     "MGMT_WATCHDOG_SEC": 90,
+    # A guard loop runs ON THE VM during a test. Every second it restores the management
+    # rule/route and the test IP's rule/route, and removes a default route through the
+    # test NIC. The VM's own network service can undo these when a NIC is hot-plugged,
+    # which cuts the management connection. The guard stops by itself this many seconds
+    # after the last heartbeat from this computer.
+    "MGMT_GUARD": True,
+    "MGMT_GUARD_LIFE_SEC": 900,
+    "SSH_RETRIES": 6,                 # extra attempts when an ssh command cannot connect
+    "SSH_RETRY_WAIT_SEC": 8,
 
     # ---- SSH into the VM ----------------------------------------------------
     "SSH_USER": "hani",
@@ -1275,19 +1284,32 @@ class Ssh:
 
     def run(self, remote: str, stdin: Optional[str] = None, check: bool = True,
             timeout: float = 60, multiplex: bool = True) -> subprocess.CompletedProcess:
-        if multiplex:
-            self.ensure_master()
-        cmd = self.base_cmd(multiplex) + ["--", remote]
-        self.log.debug("ssh", remote=remote)
-        try:
-            p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout,
-                               encoding="utf-8", errors="replace")
-        except subprocess.TimeoutExpired:
-            raise SshError("ssh %s@%s timed out after %ss running: %s"
-                           % (self.cfg["SSH_USER"], self.host, timeout, remote))
-        if p.returncode == 255:
-            raise SshError("ssh %s@%s failed: %s" % (self.cfg["SSH_USER"], self.host,
-                                                    (p.stderr or "").strip()[:300]))
+        tries = 1 + max(0, int(self.cfg.get("SSH_RETRIES") or 0))
+        last = ""
+        for attempt in range(tries):
+            if attempt:
+                self.log.warning("ssh_retry", attempt=attempt, of=tries - 1, error=last[:160])
+                time.sleep(float(self.cfg.get("SSH_RETRY_WAIT_SEC") or 5))
+            try:
+                if multiplex:
+                    self.ensure_master()
+                cmd = self.base_cmd(multiplex) + ["--", remote]
+                self.log.debug("ssh", remote=remote)
+                p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout,
+                                   encoding="utf-8", errors="replace")
+            except subprocess.TimeoutExpired:
+                last = "timed out after %ss running: %s" % (timeout, remote)
+                continue
+            except SshError as exc:                 # the login itself failed
+                last = str(exc)
+                continue
+            if p.returncode == 255:                 # connection-level failure: retry
+                last = (p.stderr or "").strip()[:300]
+                continue
+            break
+        else:
+            raise SshError("ssh %s@%s failed after %d attempt(s): %s"
+                           % (self.cfg["SSH_USER"], self.host, tries, last))
         if check and p.returncode != 0:
             raise SshError("remote command failed (rc=%d): %s\n%s"
                            % (p.returncode, remote, (p.stderr or p.stdout).strip()[:500]))
@@ -1449,6 +1471,59 @@ nohup setsid sh -c "sleep $WD; [ -f $OK ] || { ip rule del from $MIP/32 lookup $
 echo armed
 """
 
+MGMT_GUARD_SH = r"""
+D=/run/arvin-agent-badip
+mkdir -p "$D"
+cat > "$D/guard.env" <<E
+MIP='$MIP'
+MIF='$MIF'
+MGW='$MGW'
+MNET='$MNET'
+MT='$MT'
+MPR='$MPR'
+LIFE='$LIFE'
+E
+date +%s > "$D/guard.alive"
+cat > "$D/guard.sh" <<'G'
+#!/bin/sh
+# arvin-agent-badip guard: keeps the management path alive while a test IP is attached
+D=/run/arvin-agent-badip
+. "$D/guard.env"
+while [ -f "$D/guard.alive" ]; do
+  NOW=$(date +%s); LAST=$(cat "$D/guard.alive" 2>/dev/null || echo 0)
+  [ $((NOW - LAST)) -gt "$LIFE" ] && break
+  ip rule show | grep -q "from $MIP lookup $MT" || ip rule add from "$MIP/32" lookup "$MT" priority "$MPR"
+  ip route replace "$MNET" dev "$MIF" src "$MIP" table "$MT" 2>/dev/null
+  ip route replace default via "$MGW" dev "$MIF" table "$MT" 2>/dev/null
+  ip -4 route show default dev "$MIF" table main | grep -q . || ip route add default via "$MGW" dev "$MIF" 2>/dev/null
+  if [ -f "$D/test.env" ]; then
+    . "$D/test.env"
+    if ip link show dev "$IF" >/dev/null 2>&1; then
+      ip link set dev "$IF" up 2>/dev/null
+      ip -4 addr show dev "$IF" | grep -q " $IP/" || ip addr add "$IP/$PLEN" dev "$IF" 2>/dev/null
+      ip route replace "$NET" dev "$IF" src "$IP" table "$T" 2>/dev/null
+      ip route replace default via "$GW" dev "$IF" table "$T" 2>/dev/null
+      ip rule show | grep -q "from $IP lookup $T" || ip rule add from "$IP/32" lookup "$T" priority "$PR"
+      ip -4 route show default dev "$IF" table main | while read -r r; do
+        ip route del $r dev "$IF" table main 2>/dev/null
+      done
+    fi
+  fi
+  sleep 1
+done
+rm -f "$D/guard.alive" "$D/test.env"
+G
+pkill -f "$D/guard.sh" 2>/dev/null || true
+nohup setsid sh "$D/guard.sh" >/dev/null 2>&1 </dev/null &
+echo guard
+"""
+
+MGMT_GUARD_STOP_SH = r"""
+D=/run/arvin-agent-badip
+rm -f "$D/guard.alive" "$D/test.env"
+pkill -f "$D/guard.sh" 2>/dev/null || true
+"""
+
 MGMT_UNPROTECT_SH = r"""
 while ip rule show | grep -q "from $MIP lookup $MT"; do ip rule del from "$MIP/32" lookup "$MT" || break; done
 ip route flush table "$MT" 2>/dev/null || true
@@ -1498,6 +1573,8 @@ true
 """
 
 TESTIP_DOWN_SH = r"""
+rm -f /run/arvin-agent-badip/test.env        # so the guard stops restoring this test IP
+sleep 2
 while ip rule show | grep -q "from $IP lookup"; do ip rule del from "$IP/32" || break; done
 ip route flush table "$T" 2>/dev/null || true
 if [ -n "$IF" ]; then ip addr del "$IP/$PLEN" dev "$IF" 2>/dev/null || true; fi
@@ -1753,11 +1830,22 @@ class Agent:
             raise AbortRun("management SSH failed after pinning the management route (%s); the VM "
                            "watchdog reverts it within %ss" % (exc, self.cfg["MGMT_WATCHDOG_SEC"]))
         self.log.info("mgmt_route_pinned", ip=self.cfg["MANAGEMENT_IP"], table=self.cfg["MGMT_TABLE"])
+        if self.cfg["MGMT_GUARD"]:
+            self.ssh.sudo_sh(self._mgmt_vars() + sh_vars(LIFE=int(self.cfg["MGMT_GUARD_LIFE_SEC"]))
+                             + MGMT_GUARD_SH)
+            self.log.info("mgmt_guard_started", life_sec=self.cfg["MGMT_GUARD_LIFE_SEC"])
+
+    def guard_beat(self) -> None:
+        """Tell the guard on the VM that this computer is still running the test."""
+        if self.cfg["PROTECT_MGMT_ROUTE"] and self.cfg["MGMT_GUARD"]:
+            with contextlib.suppress(AgentError):
+                self.ssh.sudo_sh("[ -f /run/arvin-agent-badip/guard.alive ] && "
+                                 "date +%s > /run/arvin-agent-badip/guard.alive || true")
 
     def unprotect_mgmt(self) -> None:
         if self.cfg["PROTECT_MGMT_ROUTE"]:
             with contextlib.suppress(AgentError):
-                self.ssh.sudo_sh(self._mgmt_vars() + MGMT_UNPROTECT_SH)
+                self.ssh.sudo_sh(MGMT_GUARD_STOP_SH + self._mgmt_vars() + MGMT_UNPROTECT_SH)
                 self.log.info("mgmt_route_unpinned")
 
     # --------------------------------------------------------------- release --
@@ -1936,8 +2024,13 @@ class Agent:
             raise AgentError("cannot determine subnet/gateway for %s" % ip)
         pend.update(plen=ipaddress.ip_network(cidr, strict=False).prefixlen, cidr=cidr, gateway=gw)
         self.state.save()
-        self.ssh.sudo_sh(sh_vars(IF=ifname, IP=ip, PLEN=pend["plen"], NET=str(ipaddress.ip_network(cidr, strict=False)),
-                                 GW=gw, T=pend["table"], PR=cfg["POLICY_PRIORITY"]) + TESTIP_UP_SH)
+        tvars = sh_vars(IF=ifname, IP=ip, PLEN=pend["plen"], NET=str(ipaddress.ip_network(cidr, strict=False)),
+                        GW=gw, T=pend["table"], PR=cfg["POLICY_PRIORITY"])
+        guard = ""
+        if cfg["PROTECT_MGMT_ROUTE"] and cfg["MGMT_GUARD"]:     # the guard keeps these in place
+            guard = ("mkdir -p /run/arvin-agent-badip\ncat > /run/arvin-agent-badip/test.env <<'E'\n"
+                     + tvars + "E\n")
+        self.ssh.sudo_sh(tvars + guard + TESTIP_UP_SH)
         self.log.info("configured", ip=ip, iface=ifname, cidr=cidr, gateway=gw)
         # management must still be fine
         if not self.ssh.fresh_ok():
@@ -1958,6 +2051,10 @@ class Agent:
                 rec["from_mac_tcp"] = False
         # ---- 3) test from Iran ---------------------------------------------------------
         for i in range(int(cfg["CHECKS_PER_IP"])):
+            self.guard_beat()
+            if i:
+                print("  waiting for the next check of %s (check-host allows one per %ss) ..."
+                      % (ip, cfg["CHECKHOST_MIN_SPACING_SEC"]), flush=True)
             try:
                 res = self.reach.cycle(ip, "test-ip")
             except InconclusiveError as exc:
@@ -2040,6 +2137,7 @@ class Agent:
                 if n > 1:
                     time.sleep(float(self.cfg["ROUND_SPACING_SEC"]))
                 print("\n===== round %d/%d =====" % (n, rounds))
+                self.guard_beat()
                 rec = self.one_round(run_id, n, seen)
                 seen.add(rec["ip"])
                 out.append(rec)

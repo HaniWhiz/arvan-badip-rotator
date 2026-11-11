@@ -28,6 +28,8 @@ The management IP is never released, and neither is its port or any port that ex
 
 Before the first round, the management IP's replies are pinned to its own NIC with a policy route (`from <mgmt-ip> lookup 2099`). A new NIC therefore can't take over your SSH return path. The pin is confirmed with a **fresh** SSH connection. If that confirmation fails, a watchdog inside the VM undoes the pin after 90 s. The pin is removed at the end of the run.
 
+**Guard on the server:** on this ArvanCloud image, adding an IP can cut the management connection until the IP is removed, because the server's network service reconfigures when the new card appears. During a test a small guard loop runs on the server itself. Every second it restores the management rule and route and the test IP's rule and route, and removes a default route through the test card. It stops by itself 15 minutes after the last heartbeat from your computer (`mgmt_guard_life_sec`), and at the end of every run. SSH commands are retried (`ssh_retries`) instead of failing on the first lost connection.
+
 **Per-IP verdicts** (computed from that IP's cycles):
 
 | Verdict | Meaning |
