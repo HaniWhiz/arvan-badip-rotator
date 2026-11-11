@@ -99,6 +99,8 @@ On the VM, `hani` needs **passwordless sudo**, at least for `ip`, `sysctl`, `sh`
 
 With a `.pub` key, ssh asks the agent for exactly that key (`IdentitiesOnly=yes`).
 
+**SSH login:** on macOS the script logs in to each server once with the terminal attached, so ssh can ask for a key passphrase, a security-key PIN or a touch. Every later command reuses that connection (for up to 30 minutes, `ssh_master_persist_sec`) and never authenticates again. If the login with `ssh_key` fails, it retries the way plain `ssh hani@<ip>` does.
+
 ## Use
 
 ```sh
