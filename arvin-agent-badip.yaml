@@ -16,7 +16,7 @@
 # =============================================================================
 
 # Public IPv4 you SSH to (saved as the management IP, never released).
-# Several servers: separate them with commas. Each one is tested in turn.
+# Several servers: separate them with commas. They are tested at the same time.
 management_ip: ""                 # e.g. "185.1.1.10" or "185.1.1.10, 185.2.2.20"
 
 # ArvanCloud region code of the server (shown in the panel / API).
@@ -70,8 +70,11 @@ rounds: 5                         # how many test IPs per run (allocate -> test 
 checks_per_ip: 2                  # check-host cycles per test IP
 round_spacing_sec: 60             # pause between rounds
 baseline_check: false             # off: the management IP is known good and is not judged
+parallel: true                    # several management IPs: test all servers at the same time
+                                  # (false = one server after another)
 
-# Regions tested on every check (check-host.net node country codes). The verdict uses "iran" only.
+# Regions tested on every check (check-host.net node country codes).
+# "iran" is the Iranian group; every other region counts as "outside Iran".
 # one line: region=country codes, regions separated by ";"
 probe_regions: "iran=ir; europe=de,nl,fr,gb,se,fi,pl,ch,at,cz,es,it,ro; usa=us; asia=sg,jp,hk,in,kr; other=au,br,za,ca,ae,tr"
 probe_per_region: 3
@@ -85,8 +88,12 @@ check_http_path: /                # only for check_type: http
 # OPTIONAL: verdict tuning (defaults are usually fine)
 # =============================================================================
 
-min_conclusive_nodes: 3           # Iranian nodes needed for a verdict
-fail_ratio_threshold: 0.5         # blocked if more than this share of Iranian nodes fail
+# An IP is GOOD only if it is reachable from Iran AND from outside Iran. It is BAD when:
+#   Iran only        Iran reaches it, but fewer than outside_min_ok nodes outside Iran do
+#   blocked in Iran  nodes outside Iran reach it, but Iran does not
+outside_min_ok: 1                 # 1 = "not even one node outside Iran"; 0 turns the Iran-only rule off
+min_conclusive_nodes: 3           # nodes that must answer (in Iran, and outside Iran) for a verdict
+fail_ratio_threshold: 0.5         # Iran does not reach it if more than this share of Iranian nodes fail
 probe_max_nodes: 10
 probe_nodes: []                   # [] = all check-host nodes in Iran (auto)
 control_nodes: []                 # [] = 3 nodes outside Iran (auto)
@@ -99,6 +106,12 @@ iran_control_target: "1.1.1.1:443"
 protect_mgmt_route: true          # pin the management IP's replies to its own NIC
 mgmt_watchdog_sec: 90             # VM auto-reverts the pin if a fresh SSH can't confirm it
 max_public_ips_per_server: 4      # ArvanCloud per-server cap
+# check-host.net pacing (its limits are not documented, so both values are cautious):
+check_spacing_sec: 60             # between two checks of the SAME IP
+checkhost_min_spacing_sec: 30     # between any two requests, from ALL servers together
+# One server alone sends one request per 60 s. Servers tested at the same time interleave, up to
+# one request per 30 s. If check-host starts refusing requests, the script waits 2 minutes and
+# that check may come out unclear: then set checkhost_min_spacing_sec to 60.
 nic_appear_timeout_sec: 120
 port_active_timeout_sec: 180
 release_timeout_sec: 180

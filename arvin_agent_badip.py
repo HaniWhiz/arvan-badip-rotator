@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 arvin-agent-badip: find out whether the IPv4 addresses ArvanCloud hands out
-are reachable from Iran ("good") or blocked ("bad").
+are "good" (reachable from Iran AND from outside Iran) or "bad" (one side only).
 
 It runs on your Mac, not on the server. It uses two separate credentials:
 
@@ -55,6 +55,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -96,11 +97,6 @@ DEFAULTS: Dict[str, Any] = {
     "MGMT_TABLE": 2099,
     "MGMT_PRIORITY": 20999,
     "MGMT_WATCHDOG_SEC": 90,
-    # A guard loop runs ON THE VM during a test. Every second it restores the management
-    # rule/route and the test IP's rule/route, and removes a default route through the
-    # test NIC. The VM's own network service can undo these when a NIC is hot-plugged,
-    # which cuts the management connection. The guard stops by itself this many seconds
-    # after the last heartbeat from this computer.
     # How a new IP gets configured inside the VM:
     #   panel -> ArvanCloud does it: it writes the netplan config and the route when an IP
     #            is added, and removes them when it is deleted. While a test IP is attached
@@ -110,6 +106,9 @@ DEFAULTS: Dict[str, Any] = {
     "NEW_IP_SETTLE_SEC": 45,          # panel mode: wait for the panel to configure the new IP
     "DOWN_RETRY_WAIT_SEC": 60,        # panel mode: wait before re-checking an IP that looked DOWN
     "MGMT_RETURN_WAIT_SEC": 90,       # panel mode: wait for management to answer after a release
+    # ssh mode: a guard loop runs ON THE VM during a test. Every second it restores the
+    # management rule/route and the test IP's rule/route, and removes a default route
+    # through the test NIC. It stops by itself MGMT_GUARD_LIFE_SEC after the last heartbeat.
     "MGMT_GUARD": True,
     "MGMT_GUARD_LIFE_SEC": 900,
     "SSH_RETRIES": 6,                 # extra attempts when an ssh command cannot connect
@@ -138,8 +137,16 @@ DEFAULTS: Dict[str, Any] = {
     "CHECKS_PER_IP": 2,               # check-host cycles per test IP
     "ROUND_SPACING_SEC": 60,          # pause between rounds
     "BASELINE_CHECK": False,          # off: the management IP is known good, never judged
-    # Every check is also run from these regions (check-host.net node country codes).
-    # The GOOD/BAD verdict uses the "iran" group only; the others are shown for comparison.
+    # Several management IPs: test all servers at the same time (panel mode only).
+    # False = one server after another.
+    "PARALLEL": True,
+    # What makes an IP BAD:
+    #   Iran only        -> Iran reaches it, but fewer than OUTSIDE_MIN_OK nodes outside Iran do
+    #   blocked in Iran  -> nodes outside Iran reach it, but Iran does not
+    # GOOD needs both: reachable from Iran AND from outside Iran. 0 turns the Iran-only rule off.
+    "OUTSIDE_MIN_OK": 1,
+    # Every check runs from these regions (check-host.net node country codes). "iran" is the
+    # Iranian group; every other region counts as "outside Iran".
     "PROBE_REGIONS": {"iran": ["ir"],
                       "europe": ["de", "nl", "fr", "gb", "se", "fi", "pl", "ch", "at", "cz", "es", "it", "ro"],
                       "usa": ["us"],
@@ -177,7 +184,13 @@ DEFAULTS: Dict[str, Any] = {
                                "nl1.node.check-host.net"],
     "CONTROL_MIN_SUCCESS": 1,
     "IRAN_CONTROL_TARGET": "1.1.1.1:443",
-    "CHECKHOST_MIN_SPACING_SEC": 60,
+    # check-host.net pacing. Its limits are not documented, so both values are cautious:
+    #   CHECK_SPACING_SEC          between two checks of the SAME IP
+    #   CHECKHOST_MIN_SPACING_SEC  between any two requests, from all servers together
+    # One server alone sends one request per CHECK_SPACING_SEC. Servers tested at the same
+    # time interleave, up to one request per CHECKHOST_MIN_SPACING_SEC.
+    "CHECK_SPACING_SEC": 60,
+    "CHECKHOST_MIN_SPACING_SEC": 30,
     "CHECKHOST_RESULT_WAIT_SEC": 30,
     "CHECKHOST_RESULT_POLL_SEC": 3,
     "CHECKHOST_LIMIT_BACKOFF_SEC": 120,
@@ -195,6 +208,48 @@ HOME_DIR = os.path.expanduser(os.environ.get("ABIP_HOME", "~/" + PROJECT))
 KEYCHAIN_SERVICE = PROJECT
 
 _SECRET_HINTS = ("key", "token", "secret", "password", "apikey", "authorization")
+
+# ---- shared by every server in one run ---------------------------------------------------------
+IO_LOCK = threading.RLock()       # the results files, the log files and the terminal
+STOP = threading.Event()          # parallel run: set by the main thread on Ctrl-C
+_TL = threading.local()           # per worker thread: .stopping, .shield
+PARALLEL_ACTIVE = False           # True while worker threads are running
+RULES: Dict[str, Any] = {"OUTSIDE_MIN_OK": 1, "MIN_CONCLUSIVE_NODES": 3}   # used when results are shown
+
+
+class StopRequested(BaseException):
+    """Raised in a worker thread's sleep when every server was asked to stop (Ctrl-C).
+    A BaseException, so the `except AgentError` handlers do not swallow it."""
+
+
+def nap(seconds: float) -> None:
+    """Sleep. In a parallel run a worker wakes early, once, when a stop was requested;
+    after that (and while it is releasing an IP) its sleeps are ordinary again."""
+    seconds = max(0.0, float(seconds))
+    if not PARALLEL_ACTIVE or getattr(_TL, "stopping", False) or getattr(_TL, "shield", 0):
+        time.sleep(seconds)
+        return
+    whole = int(seconds)
+    for _ in range(whole):
+        if STOP.is_set():
+            break
+        time.sleep(1.0)
+    else:
+        if seconds > whole and not STOP.is_set():
+            time.sleep(seconds - whole)
+    if STOP.is_set():
+        _TL.stopping = True
+        raise StopRequested()
+
+
+@contextlib.contextmanager
+def shielded() -> Any:
+    """Inside this block a stop request does not interrupt sleeps (used while releasing an IP)."""
+    _TL.shield = getattr(_TL, "shield", 0) + 1
+    try:
+        yield
+    finally:
+        _TL.shield -= 1
 
 
 def utcnow() -> _dt.datetime:
@@ -458,6 +513,7 @@ def load_config(overrides: Optional[Dict[str, Any]] = None,
         if v is not None:
             cfg[k] = v
     cfg["_YAML_PATH"] = ypath or ""
+    RULES.update(OUTSIDE_MIN_OK=int(cfg["OUTSIDE_MIN_OK"]), MIN_CONCLUSIVE_NODES=int(cfg["MIN_CONCLUSIVE_NODES"]))
     return cfg
 
 
@@ -497,13 +553,14 @@ def server_config(base: Dict[str, Any], ip: str, index: int, count: int) -> Dict
 class EventLog:
     LEVELS = {"debug": 10, "info": 20, "warning": 30, "error": 40}
 
-    def __init__(self, cfg: Dict[str, Any], quiet: bool = False):
+    def __init__(self, cfg: Dict[str, Any], quiet: bool = False, tag: str = ""):
         self.min = self.LEVELS.get(str(cfg.get("LOG_LEVEL", "info")).lower(), 20)
         self.quiet = quiet
+        self.tag = tag                 # the management IP, when several servers share the screen
         os.makedirs(HOME_DIR, exist_ok=True)
 
     def _append(self, fname: str, rec: Dict[str, Any]) -> None:
-        with contextlib.suppress(OSError):
+        with IO_LOCK, contextlib.suppress(OSError):
             with open(os.path.join(HOME_DIR, fname), "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(redact(rec), ensure_ascii=False, sort_keys=True) + "\n")
 
@@ -511,17 +568,33 @@ class EventLog:
         if self.LEVELS.get(level, 20) < self.min:
             return
         rec = {"ts": iso(), "level": level, "event": event}
+        if self.tag:
+            rec["server"] = self.tag
         rec.update(fields)
         self._append("events.jsonl", rec)
         if not self.quiet:
-            tag = {"debug": "·", "info": "•", "warning": "!", "error": "✗"}.get(level, "•")
+            mark = {"debug": "·", "info": "•", "warning": "!", "error": "✗"}.get(level, "•")
             extra = " ".join("%s=%s" % (k, json.dumps(redact(v), ensure_ascii=False))
                              for k, v in fields.items())
-            sys.stdout.write("%s %s %-24s %s\n" % (time.strftime("%H:%M:%S"), tag, event, extra))
+            who = "[%s] " % self.tag if self.tag else ""
+            with IO_LOCK:
+                sys.stdout.write("%s %s%s %-24s %s\n" % (time.strftime("%H:%M:%S"), who, mark, event, extra))
+                sys.stdout.flush()
+
+    def say(self, text: str) -> None:
+        """A plain progress line (tagged with the server when several share the screen)."""
+        if self.quiet:
+            return
+        who = "[%s] " % self.tag if self.tag else ""
+        with IO_LOCK:
+            for line in text.split("\n"):
+                sys.stdout.write((who + line if line.strip() else "") + "\n")
             sys.stdout.flush()
 
     def check(self, rec: Dict[str, Any]) -> None:
         r = {"ts": iso()}
+        if self.tag:
+            r["server"] = self.tag
         r.update(rec)
         self._append("checks.jsonl", r)
 
@@ -549,25 +622,42 @@ class State:
         return self.data.get("pending")
 
 
-RESULT_FIELDS = ["finished_at", "server", "run_id", "round", "ip", "port_id", "verdict",
-                 "reachable_cycles", "blocked_cycles", "down_cycles", "inconclusive_cycles",
-                 "best_ok_ratio", "egress_ok", "from_mac_tcp", "seen_before",
+RESULT_FIELDS = ["finished_at", "server", "run_id", "round", "ip", "port_id", "verdict", "reason",
+                 "checks", "reachable_cycles", "iran_only_cycles", "blocked_cycles", "down_cycles",
+                 "inconclusive_cycles", "best_ok_ratio", "egress_ok", "from_mac_tcp", "seen_before",
                  "released", "error", "regions_text", "links"]
 
 
 def append_result(rec: Dict[str, Any]) -> None:
-    os.makedirs(HOME_DIR, exist_ok=True)
-    with open(os.path.join(HOME_DIR, "results.jsonl"), "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+    """results.jsonl is the record (append-only). results.csv is rebuilt from it each time,
+    so its columns always line up and every row is shown under the current rules."""
+    with IO_LOCK:
+        os.makedirs(HOME_DIR, exist_ok=True)
+        with open(os.path.join(HOME_DIR, "results.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+        rewrite_csv()
+
+
+def rewrite_csv() -> None:
     cpath = os.path.join(HOME_DIR, "results.csv")
-    new = not os.path.exists(cpath)
-    with open(cpath, "a", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=RESULT_FIELDS, extrasaction="ignore")
-        if new:
+    with IO_LOCK, contextlib.suppress(OSError):          # e.g. the file is open in a spreadsheet
+        tmp = cpath + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=RESULT_FIELDS, extrasaction="ignore")
             w.writeheader()
-        row = dict(rec)
-        row["links"] = " ".join(rec.get("links") or [])
-        w.writerow(row)
+            for r in load_results():
+                row = dict(r)
+                kinds = row_check_kinds(r)
+                row["verdict"], row["reason"] = judge_row(r)
+                row["checks"] = checks_text(kinds)
+                if kinds:
+                    row.update(reachable_cycles=kinds.count(REACHABLE), iran_only_cycles=kinds.count(IRAN_ONLY),
+                               blocked_cycles=kinds.count(BLOCKED), down_cycles=kinds.count(DOWN),
+                               inconclusive_cycles=kinds.count(INCONCLUSIVE))
+                row["regions_text"] = regions_text(r.get("regions") or {}) or r.get("regions_text") or ""
+                row["links"] = " ".join(r.get("links") or [])
+                w.writerow(row)
+        os.replace(tmp, cpath)
 
 
 def load_results() -> List[Dict[str, Any]]:
@@ -741,7 +831,7 @@ class Http:
                     body = b""
             except (urllib.error.URLError, socket.timeout, ConnectionError, ssl.SSLError, OSError) as exc:
                 if attempt < attempts - 1:
-                    time.sleep(backoff * (2 ** attempt))
+                    nap(backoff * (2 ** attempt))
                     continue
                 if mutating and not idempotent:
                     raise AmbiguousRequestError("%s %s failed at network level (%s); it MAY have "
@@ -760,7 +850,7 @@ class Http:
                 ra = rh.get("retry-after")
                 if ra and ra.isdigit():
                     wait = max(wait, min(float(ra), 120.0))
-                time.sleep(wait)
+                nap(wait)
                 continue
             return HttpResponse(status, rh, body, url)
         raise TransientError("request failed")  # pragma: no cover
@@ -848,7 +938,8 @@ class ArvanAPI:
 
     # Endpoints below are the ones ArvanCloud's own Terraform provider uses
     # (github.com/arvancloud/terraform-provider-arvan, internal/api/iaas):
-    #   POST  /servers/{id}/add-public-ip          empty body, reply not used
+    #   POST  /servers/{id}/add-public-ip          {"type": "ipv4", "security_groups": [firewall id]}
+    #                                              (the provider sends no body; the real API refuses that)
     #   PATCH /networks/{port_id}/detach           {"server_id": ...}
     #   GET   /networks                            subnets[].servers[].ips[] = the ports
     def add_public_ip_preview(self) -> Dict[str, Any]:
@@ -953,7 +1044,12 @@ class ArvanAPI:
 # =============================================================================
 # check-host.net reachability from Iran (with control nodes outside Iran)
 # =============================================================================
-REACHABLE, BLOCKED, INCONCLUSIVE, DOWN = "REACHABLE", "BLOCKED", "INCONCLUSIVE", "DOWN"
+# What one check (one check-host request from every region) can say about an IP:
+#   REACHABLE  Iran reaches it and so does the world outside Iran
+#   IRAN_ONLY  Iran reaches it, the world outside Iran does not   -> bad
+#   BLOCKED    the world outside Iran reaches it, Iran does not    -> bad
+#   DOWN       nobody reaches it
+REACHABLE, BLOCKED, INCONCLUSIVE, DOWN, IRAN_ONLY = "REACHABLE", "BLOCKED", "INCONCLUSIVE", "DOWN", "IRAN_ONLY"
 
 
 class CheckHostLimit(TransientError):
@@ -997,13 +1093,17 @@ def classify_node_result(ctype: str, value: Any) -> Tuple[str, str]:
 
 
 class CheckHost:
-    last_submit = 0.0          # shared by all servers in one run (check-host rate limit)
+    # Shared by every server in a run: check-host.net sees one client, so submissions from
+    # all servers are paced together (one per CHECKHOST_MIN_SPACING_SEC).
+    last_submit = 0.0
+    _lock = threading.Lock()
     PREFERRED_CONTROL_COUNTRIES = ("de", "nl", "fi", "fr", "se", "gb", "pl", "ch", "at", "cz")
 
     def __init__(self, cfg: Dict[str, Any], http: Http, log: EventLog):
         self.cfg, self.http, self.log = cfg, http, log
         self.base = cfg["CHECKHOST_BASE"].rstrip("/")
         self._nodes: Optional[Dict[str, Any]] = None
+        self.last_own_submit = 0.0     # this server's latest request (CHECK_SPACING_SEC)
 
     def nodes(self) -> Dict[str, Any]:
         if self._nodes is None:
@@ -1058,14 +1158,15 @@ class CheckHost:
         return list(self.cfg["CONTROL_NODES_FALLBACK"])
 
     def submit(self, ctype: str, host: str, nodes: List[str]) -> Tuple[str, Dict[str, Any], str]:
-        wait = CheckHost.last_submit + float(self.cfg["CHECKHOST_MIN_SPACING_SEC"]) - time.time()
-        if wait > 0:
-            self.log.debug("checkhost_pacing", sleep_sec=int(wait))
-            time.sleep(wait)
         q = [("host", host)] + [("node", n) for n in nodes]
         url = "%s/check-%s?%s" % (self.base, ctype, urllib.parse.urlencode(q))
-        CheckHost.last_submit = time.time()
-        resp = self.http.request("GET", url, retries=0)
+        with CheckHost._lock:                               # servers take turns
+            wait = CheckHost.last_submit + float(self.cfg["CHECKHOST_MIN_SPACING_SEC"]) - time.time()
+            if wait > 0:
+                self.log.debug("checkhost_pacing", sleep_sec=int(wait))
+                nap(wait)
+            CheckHost.last_submit = self.last_own_submit = time.time()
+            resp = self.http.request("GET", url, retries=0)
         j = resp.json
         if resp.status == 429 or (isinstance(j, dict) and j.get("error") == "limit_exceeded"):
             raise CheckHostLimit("check-host.net rate limit")
@@ -1077,7 +1178,7 @@ class CheckHost:
         deadline = time.time() + float(self.cfg["CHECKHOST_RESULT_WAIT_SEC"])
         last: Dict[str, Any] = {}
         while True:
-            time.sleep(float(self.cfg["CHECKHOST_RESULT_POLL_SEC"]))
+            nap(float(self.cfg["CHECKHOST_RESULT_POLL_SEC"]))
             resp = self.http.request("GET", "%s/check-result/%s" % (self.base, rid), retries=1)
             if resp.status == 200 and isinstance(resp.json, dict):
                 last = resp.json
@@ -1094,8 +1195,11 @@ class CheckHost:
                 return self.results(rid, acc), acc, link
             except CheckHostLimit:
                 if attempt == 0:
-                    self.log.warning("checkhost_limit_backoff", sleep_sec=self.cfg["CHECKHOST_LIMIT_BACKOFF_SEC"])
-                    time.sleep(float(self.cfg["CHECKHOST_LIMIT_BACKOFF_SEC"]))
+                    backoff = float(self.cfg["CHECKHOST_LIMIT_BACKOFF_SEC"])
+                    self.log.warning("checkhost_limit_backoff", sleep_sec=backoff)
+                    with CheckHost._lock:                   # every server backs off, not only this one
+                        CheckHost.last_submit = max(CheckHost.last_submit, time.time() + backoff
+                                                    - float(self.cfg["CHECKHOST_MIN_SPACING_SEC"]))
         raise InconclusiveError("check-host.net rate limit persisted")
 
 
@@ -1149,22 +1253,35 @@ class Reachability:
         ctl_concl = sum(1 for x in ctl.values() if x["v"] in ("ok", "fail"))
         res: Dict[str, Any] = {"purpose": purpose, "ip": ip, "type": ctype, "target": self.target(ip),
                                "link": link, "ok": len(ok), "fail": len(fail), "unknown": len(unknown),
-                               "control_ok": ctl_ok, "nodes": per_node, "by_region": by_region}
+                               "control_ok": ctl_ok, "outside_ok": ctl_ok, "outside_fail": ctl_concl - ctl_ok,
+                               "nodes": per_node, "by_region": by_region}
         min_c, thr = int(self.cfg["MIN_CONCLUSIVE_NODES"]), float(self.cfg["FAIL_RATIO_THRESHOLD"])
+        need_out = int(self.cfg["OUTSIDE_MIN_OK"])
 
         def finish(verdict: str, why: str) -> Dict[str, Any]:
             concl = res["ok"] + res["fail"]
             res.update(verdict=verdict, why=why, ok_ratio=round(res["ok"] / concl, 3) if concl else None)
             self.log.check(res)
             self.log.event("info" if verdict == REACHABLE else "warning", "reachability_cycle",
-                           purpose=purpose, ip=ip, verdict=verdict, ok=res["ok"], fail=res["fail"],
-                           unknown=res["unknown"], control_ok=ctl_ok, why=why, link=link)
+                           purpose=purpose, ip=ip, verdict=verdict,
+                           iran="%d/%d" % (res["ok"], concl), outside="%d/%d" % (ctl_ok, ctl_concl),
+                           why=why, link=link)
             return res
+
+        def iran_reaches_it(how: str) -> Dict[str, Any]:
+            """Iran reaches the IP. That is only good if the world outside Iran reaches it too."""
+            if need_out <= 0 or ctl_ok >= need_out:
+                return finish(REACHABLE, "%s and %d/%d nodes outside Iran" % (how, ctl_ok, ctl_concl))
+            if ctl_concl < min_c:
+                return finish(INCONCLUSIVE, "%s, but only %d node(s) outside Iran gave an answer"
+                              % (how, ctl_concl))
+            return finish(IRAN_ONLY, "%s, but %d of %d nodes outside Iran did (Iran-only IP)"
+                          % (how, ctl_ok, ctl_concl))
 
         if len(ok) + len(fail) < min_c:
             return finish(INCONCLUSIVE, "only %d conclusive Iranian nodes (< %d)" % (len(ok) + len(fail), min_c))
         if len(fail) / float(len(ok) + len(fail)) <= thr:
-            return finish(REACHABLE, "%d/%d Iranian nodes reached it" % (len(ok), len(ok) + len(fail)))
+            return iran_reaches_it("%d/%d Iranian nodes reached it" % (len(ok), len(ok) + len(fail)))
         if ctl_ok < int(self.cfg["CONTROL_MIN_SUCCESS"]):
             if ctl_concl == 0:
                 return finish(INCONCLUSIVE, "Iran failed but no control node answered")
@@ -1183,23 +1300,80 @@ class Reachability:
             if len(ok) + len(fail) < min_c:
                 return finish(INCONCLUSIVE, "Iranian probe nodes look unhealthy (cannot reach %s)" % guard)
             if len(fail) / float(len(ok) + len(fail)) <= thr:
-                return finish(REACHABLE, "after probe-health filtering %d/%d reached" % (len(ok), len(ok) + len(fail)))
-        return finish(BLOCKED, "%d/%d Iranian nodes failed while %d control node(s) outside Iran succeeded"
-                      % (len(fail), len(ok) + len(fail), ctl_ok))
+                return iran_reaches_it("after probe-health filtering %d/%d Iranian nodes reached it"
+                                       % (len(ok), len(ok) + len(fail)))
+        return finish(BLOCKED, "%d/%d Iranian nodes failed while %d node(s) outside Iran reached it "
+                               "(blocked in Iran)" % (len(fail), len(ok) + len(fail), ctl_ok))
 
 
-def aggregate_verdict(verdicts: List[str]) -> str:
-    """Per-IP verdict from its cycles: GOOD, BAD, MIXED, UNTESTABLE or INCONCLUSIVE."""
-    r, b, d = verdicts.count(REACHABLE), verdicts.count(BLOCKED), verdicts.count(DOWN)
-    if b > r:
-        return "BAD"
-    if r > b:
-        return "GOOD"
-    if r and r == b:
-        return "MIXED"
-    if d:
-        return "UNTESTABLE"
-    return "INCONCLUSIVE"
+CHECK_LETTER = {REACHABLE: "R", IRAN_ONLY: "I", BLOCKED: "B", DOWN: "D", INCONCLUSIVE: "?"}
+CHECK_WORDS = {REACHABLE: "reachable", IRAN_ONLY: "Iran only", BLOCKED: "blocked in Iran", DOWN: "down"}
+
+
+def aggregate_verdict(kinds: List[str]) -> Tuple[str, str]:
+    """Per-IP state from its checks -> (state, reason).
+
+      GOOD   reachable from Iran AND from outside Iran
+      BAD    Iran only (no node outside Iran reached it), or blocked in Iran (only outside did)
+      DOWN   no region reached it
+      MIXED  the checks disagree
+
+    A state needs more than half of the checks that gave a clear answer."""
+    r, io, b, d = (kinds.count(x) for x in (REACHABLE, IRAN_ONLY, BLOCKED, DOWN))
+    n = r + io + b + d
+    if n == 0:
+        return "INCONCLUSIVE", "no check gave a clear answer"
+    if 2 * r > n:
+        return "GOOD", ""
+    if 2 * (io + b) > n:
+        if io and b:
+            return "BAD", "Iran only / blocked in Iran"
+        return "BAD", "Iran only" if io else "blocked in Iran"
+    if 2 * d > n:
+        return "DOWN", "no region reached it"
+    return "MIXED", "checks disagree: " + ", ".join(CHECK_WORDS[x] for x in (REACHABLE, IRAN_ONLY, BLOCKED, DOWN)
+                                                     if x in kinds)
+
+
+def checks_text(kinds: List[str]) -> str:
+    """One letter per check: R reachable, I Iran only, B blocked in Iran, D down, ? unclear."""
+    return "".join(CHECK_LETTER.get(k, "?") for k in kinds)
+
+
+def row_check_kinds(row: Dict[str, Any]) -> List[str]:
+    """The kind of each check of a saved result, under the CURRENT rules. Results saved before
+    the Iran-only rule stored a check as REACHABLE whenever Iran reached the IP; they are
+    re-read here from the counts they kept (nodes outside Iran that reached the IP)."""
+    need = int(RULES.get("OUTSIDE_MIN_OK") or 0)
+    min_c = int(RULES.get("MIN_CONCLUSIVE_NODES") or 1)
+    cycles = row.get("cycles") or []
+    outside_total = sum(int(d.get("ok", 0)) + int(d.get("fail", 0))
+                        for name, d in (row.get("regions") or {}).items() if name != "iran")
+    kinds: List[str] = []
+    for c in cycles:
+        v = c.get("verdict") or INCONCLUSIVE
+        if v in (REACHABLE, IRAN_ONLY):
+            ok = c.get("outside_ok", c.get("control_ok"))
+            if "outside_fail" in c:
+                answered = int(ok or 0) + int(c["outside_fail"] or 0)
+            else:                                   # older result: only the totals were kept
+                answered = outside_total // max(1, len(cycles))
+            if need <= 0:
+                v = REACHABLE
+            elif ok is not None and int(ok) >= need:
+                v = REACHABLE
+            elif ok is not None and answered >= min_c:
+                v = IRAN_ONLY
+        kinds.append(v)
+    return kinds
+
+
+def judge_row(row: Dict[str, Any]) -> Tuple[str, str]:
+    """(state, reason) of a saved result under the current rules."""
+    kinds = row_check_kinds(row)
+    if not kinds:                                   # never tested (e.g. released after an error)
+        return str(row.get("verdict") or "?"), str(row.get("reason") or row.get("error") or "")
+    return aggregate_verdict(kinds)
 
 
 # =============================================================================
@@ -1303,7 +1477,7 @@ class Ssh:
         for attempt in range(tries):
             if attempt:
                 self.log.warning("ssh_retry", attempt=attempt, of=tries - 1, error=last[:160])
-                time.sleep(float(self.cfg.get("SSH_RETRY_WAIT_SEC") or 5))
+                nap(float(self.cfg.get("SSH_RETRY_WAIT_SEC") or 5))
             try:
                 if multiplex:
                     self.ensure_master()
@@ -1627,7 +1801,7 @@ class Agent:
                 return v
             if time.time() >= deadline:
                 return None
-            time.sleep(interval)
+            nap(interval)
 
     def _require_init(self) -> None:
         missing = [k for k in ("MANAGEMENT_IP", "SERVER_ID", "MANAGEMENT_PORT_ID") if not self.cfg.get(k)]
@@ -1901,8 +2075,11 @@ class Agent:
             except AmbiguousRequestError as exc:
                 self.log.warning("release_ambiguous", error=str(exc))
             except ApiError as exc:
+                # e.g. a second request while the first is still being carried out. Whether the
+                # IP is really gone is decided below, from what the API lists.
                 if exc.kind != "not_found":
-                    raise
+                    self.log.warning("release_request_refused", ip=ip, error=str(exc))
+
         def still_attached() -> bool:
             # the port listing AND the server's own address list must both drop the IP
             in_ports = any(x["port_id"] == port_id or x["ip"] == ip for x in self.api.public_inventory())
@@ -1986,28 +2163,30 @@ class Agent:
             if isinstance(exc, AbortRun):
                 rec["abort"] = True
         finally:
-            # ---- 4) release (always) ---------------------------------------------
-            try:
-                rec["released"] = self.release(pend)
-            except (AgentError, TransientError) as exc:
-                rec["released"] = False
-                rec["error"] = ((rec["error"] or "") + "; release: %s" % exc).lstrip("; ")
-            if rec["released"]:
-                self.state.data["pending"] = None
-                self.state.save()
-                if self.panel:
-                    rec["mgmt_back"] = self._mgmt_back()
+            # ---- 4) release (always; a stop request waits until it is done) -------
+            with shielded():
+                try:
+                    rec["released"] = self.release(pend)
+                except (AgentError, TransientError) as exc:
+                    rec["released"] = False
+                    rec["error"] = ((rec["error"] or "") + "; release: %s" % exc).lstrip("; ")
+                if rec["released"]:
+                    self.state.data["pending"] = None
+                    self.state.save()
+                    if self.panel:
+                        rec["mgmt_back"] = self._mgmt_back()
         rec["finished_at"] = iso()
         vs = [c["verdict"] for c in rec["cycles"]]
         rec["regions_text"] = regions_text(rec.get("regions") or {})
-        rec.update(reachable_cycles=vs.count(REACHABLE), blocked_cycles=vs.count(BLOCKED),
+        rec.update(checks=checks_text(vs), reachable_cycles=vs.count(REACHABLE),
+                   iran_only_cycles=vs.count(IRAN_ONLY), blocked_cycles=vs.count(BLOCKED),
                    down_cycles=vs.count(DOWN), inconclusive_cycles=vs.count(INCONCLUSIVE),
                    best_ok_ratio=max([c.get("ok_ratio") or 0 for c in rec["cycles"]] or [None]))
         if vs:
-            rec["verdict"] = aggregate_verdict(vs)
+            rec["verdict"], rec["reason"] = aggregate_verdict(vs)
         append_result(rec)
         self.log.info("round_result", round=n, ip=rec["ip"], verdict=rec["verdict"],
-                      released=rec["released"])
+                      why=rec.get("reason") or "", regions=rec["regions_text"], released=rec["released"])
         if not rec["released"]:
             raise AbortRun("test IP %s (port %s) could NOT be confirmed released; stopping. Run "
                            "`%s cleanup --yes` or detach it in the panel" % (rec["ip"], rec["port_id"], PROJECT))
@@ -2040,7 +2219,7 @@ class Agent:
             settle = float(cfg["NEW_IP_SETTLE_SEC"])
             self.log.info("waiting_for_panel", ip=ip, seconds=int(settle),
                           note="the panel configures the IP on the VM; management is unusable meanwhile")
-            time.sleep(settle)
+            nap(settle)
         else:
             self._ssh_configure(pend, rec, port)
         # ---- informational: TCP from this Mac ----------------------------------------
@@ -2054,14 +2233,16 @@ class Agent:
         for i in range(int(cfg["CHECKS_PER_IP"])):
             self.guard_beat()
             if i:
-                print("  waiting for the next check of %s (check-host allows one per %ss) ..."
-                      % (ip, cfg["CHECKHOST_MIN_SPACING_SEC"]), flush=True)
+                self.log.say("  waiting for the next check of %s (checks of one IP are %ss apart) ..."
+                             % (ip, cfg["CHECK_SPACING_SEC"]))
+                nap(self.ch.last_own_submit + float(cfg["CHECK_SPACING_SEC"]) - time.time())
             try:
                 res = self.reach.cycle(ip, "test-ip")
             except InconclusiveError as exc:
                 res = {"verdict": INCONCLUSIVE, "why": str(exc)}
             rec["cycles"].append({k: res.get(k) for k in ("verdict", "why", "ok", "fail", "unknown",
-                                                         "control_ok", "ok_ratio", "link")})
+                                                         "control_ok", "outside_ok", "outside_fail",
+                                                         "ok_ratio", "link") if k in res})
             tot = rec.setdefault("regions", {})
             for region, d in (res.get("by_region") or {}).items():
                 t = tot.setdefault(region, {"ok": 0, "fail": 0, "unknown": 0})
@@ -2073,9 +2254,9 @@ class Agent:
                 # unreachable from every region: a server/network fault, not an Iran block
                 if self.panel:
                     if i + 1 < int(cfg["CHECKS_PER_IP"]):      # maybe the panel is not done yet
-                        print("  %s is not answering from anywhere yet; waiting %ss before the next "
-                              "check ..." % (ip, cfg["DOWN_RETRY_WAIT_SEC"]), flush=True)
-                        time.sleep(float(cfg["DOWN_RETRY_WAIT_SEC"]))
+                        self.log.say("  %s is not answering from anywhere yet; waiting %ss before the "
+                                     "next check ..." % (ip, cfg["DOWN_RETRY_WAIT_SEC"]))
+                        nap(float(cfg["DOWN_RETRY_WAIT_SEC"]))
                     continue
                 self._diagnose_down(pend, rec)      # ssh mode: collect facts while the IP is up
                 break
@@ -2098,7 +2279,7 @@ class Agent:
                     self.log.warning("management_not_back_yet", ip=cfg["MANAGEMENT_IP"],
                                      waited_sec=cfg["MGMT_RETURN_WAIT_SEC"])
                     return False
-                time.sleep(20)
+                nap(20)
 
     def _ssh_configure(self, pend: Dict[str, Any], rec: Dict[str, Any], port: Dict[str, Any]) -> None:
         """ssh mode only: put the test IP on its NIC with source policy routing."""
@@ -2177,12 +2358,15 @@ class Agent:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("\n".join(out) + "\n")
         rec["diag_file"] = path
-        print("\n----- diagnostics for DOWN test IP %s (saved to %s) -----" % (ip, path))
-        print("\n".join(out))
-        print("----- end of diagnostics -----\n", flush=True)
+        self.log.say("\n----- diagnostics for DOWN test IP %s (saved to %s) -----\n%s\n"
+                     "----- end of diagnostics -----\n" % (ip, path, "\n".join(out)))
 
     # -------------------------------------------------------------------- run --
-    def test(self, rounds: int) -> int:
+    def test(self, rounds: int, summary: bool = True) -> int:
+        """Run `rounds` rounds on this server. summary=False (parallel run): the caller prints
+        one combined summary for all servers."""
+        self.last_rows: List[Dict[str, Any]] = []
+        _TL.stopping = False
         self._require_init()
         self.api.server_id = self.cfg["SERVER_ID"]
         if self.state.pending:
@@ -2201,16 +2385,16 @@ class Agent:
                 b = self.reach.cycle(self.cfg["MANAGEMENT_IP"], "baseline-mgmt")
                 append_result({"server": self.cfg["MANAGEMENT_IP"], "run_id": run_id, "round": 0, "ip": self.cfg["MANAGEMENT_IP"],
                                "port_id": self.cfg["MANAGEMENT_PORT_ID"], "finished_at": iso(),
-                               "verdict": "MGMT-" + aggregate_verdict([b["verdict"]]),
+                               "verdict": "MGMT-" + aggregate_verdict([b["verdict"]])[0],
                                "links": [b.get("link")] if b.get("link") else [], "released": "n/a"})
-        out: List[Dict[str, Any]] = []
+        out = self.last_rows
         rc = 0
         try:
             self.protect_mgmt()
             for n in range(1, rounds + 1):
                 if n > 1:
-                    time.sleep(float(self.cfg["ROUND_SPACING_SEC"]))
-                print("\n===== round %d/%d =====" % (n, rounds))
+                    nap(float(self.cfg["ROUND_SPACING_SEC"]))
+                self.log.say("\n===== round %d/%d =====" % (n, rounds))
                 self.guard_beat()
                 rec = self.one_round(run_id, n, seen)
                 seen.add(rec["ip"])
@@ -2218,24 +2402,38 @@ class Agent:
         except AbortRun as exc:
             self.log.error("run_aborted", reason=str(exc))
             rc = 2
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, StopRequested):
+            _TL.stopping = True                    # from here on this thread's sleeps are ordinary
             self.log.warning("interrupted")
             pend = self.state.pending
+            if pend and not pend.get("port_id"):
+                # Stopped between the request for an IP and the API listing it (that takes a
+                # while). Wait for it to appear, so it can be released instead of left behind.
+                self.log.say("\nstopping: waiting for the IP that was just requested, to release it ...")
+                with contextlib.suppress(AgentError):
+                    found = self._wait_for(lambda: self._find_new_port(pend.get("ports_before") or []),
+                                           self.cfg["ALLOCATION_SETTLE_SEC"], 5)
+                    if found:
+                        pend.update(ip=found["ip"], port_id=found["port_id"], mac=found["mac"])
+                        self.state.save()
             if pend and pend.get("port_id"):
-                print("\nCtrl-C: releasing the in-flight test IP %s ..." % pend.get("ip"))
-                if self.release(pend):
-                    self.state.data["pending"] = None
-                    self.state.save()
+                self.log.say("\nstopping: releasing the in-flight test IP %s ..." % pend.get("ip"))
+                with contextlib.suppress(AgentError):
+                    if self.release(pend):
+                        self.state.data["pending"] = None
+                        self.state.save()
             rc = 4
         finally:
             self.unprotect_mgmt()
-        print("\n" + summary_table(out))
-        save_state_file()
+        if summary:
+            print("\n" + summary_table(out))
+            save_state_file()
+            if self.state.pending:
+                print("\n!! an allocation is still pending: run `%s cleanup --yes`" % PROJECT)
+            print("results: %s  (table: `%s state`, file: %s)"
+                  % (os.path.join(HOME_DIR, "results.csv"), PROJECT, os.path.join(HOME_DIR, "state.txt")))
         if self.state.pending:
-            print("\n!! an allocation is still pending: run `%s cleanup --yes`" % PROJECT)
             rc = rc or 2
-        print("results: %s  (table: `%s state`, file: %s)"
-              % (os.path.join(HOME_DIR, "results.csv"), PROJECT, os.path.join(HOME_DIR, "state.txt")))
         return rc
 
     def dry_run_report(self, rounds: int) -> int:
@@ -2248,8 +2446,13 @@ class Agent:
             print("\nonce per run, in the VM as root (pins mgmt replies; %ss watchdog):\n%s"
                   % (self.cfg["MGMT_WATCHDOG_SEC"], self._mgmt_vars() + MGMT_PROTECT_SH))
         a, d = self.api.add_public_ip_preview(), self.api.detach_preview("<NEW_PORT_ID>")
+        try:
+            fw = self.api.firewall_for_new_ip()              # read-only lookup of the firewall's ID
+        except AgentError as exc:
+            fw = ["<not found: %s>" % exc]
         print("each of %d rounds:" % rounds)
-        print("  1. %s %s (empty body)" % (a["method"], a["url"]))
+        print("  1. %s %s %s" % (a["method"], a["url"],
+                                 json.dumps({"type": self.cfg["IP_TYPE"], "security_groups": fw})))
         if self.panel:
             print("  2. wait for the new port in GET /networks, then %ss for the panel to configure it "
                   "on the VM (no ssh; management is unusable until step 4)" % self.cfg["NEW_IP_SETTLE_SEC"])
@@ -2309,58 +2512,105 @@ def regions_text(regions: Dict[str, Dict[str, int]]) -> str:
     return "  ".join(parts)
 
 
+def _ip_key(ip: Any) -> Tuple[int, Any]:
+    try:
+        return 0, int(ipaddress.ip_address(str(ip)))
+    except ValueError:
+        return 1, str(ip)
+
+
 def latest_per_ip(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """The newest row for each (server, ip), ignoring rows without a tested IP."""
+    """One row per (server, ip): its newest test. A row without checks (an IP released after
+    an error) is only used when the IP was never tested. `released` is the IP's latest
+    release status, so an IP that `cleanup` released later is not shown as still attached."""
     last: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    released: Dict[Tuple[str, str], Any] = {}
     for r in rows:
-        if r.get("ip") and r.get("round") != 0:
-            last[(r.get("server") or "", r["ip"])] = r
-    return sorted(last.values(), key=lambda r: (r.get("server") or "", r.get("ip") or ""))
+        if not r.get("ip") or r.get("round") == 0:
+            continue
+        key = (r.get("server") or "", r["ip"])
+        if r.get("released") in (True, False):
+            released[key] = r["released"]
+        if r.get("cycles") or not (last.get(key) or {}).get("cycles"):
+            last[key] = r
+    out = [dict(r, released=released[k]) if k in released else r for k, r in last.items()]
+    return sorted(out, key=lambda r: (r.get("server") or "", _ip_key(r.get("ip"))))
+
+
+STATE_ORDER = ["GOOD", "BAD", "MIXED", "DOWN", "INCONCLUSIVE"]
+STATE_FMT = "%-16s %-13s %-32s %-6s %-7s %-5s %-5s %-6s %s"
 
 
 def state_table(rows: List[Dict[str, Any]]) -> str:
-    """One line per IP: the state, then each region's reachable count from the latest test."""
+    """One line per tested IP: its state, why, and each region's reachable/tested node counts
+    from its latest test. GOOD first, then BAD, then the rest."""
     if not rows:
         return "(no tested IPs yet)"
-    head = ["IP", "STATE", "IRAN", "EUROPE", "USA", "ASIA", "OTHER", "RELEASED", "LAST TEST"]
-    lines = ["%-16s %-13s %-8s %-9s %-8s %-8s %-8s %-10s %s" % tuple(head)]
-    for r in rows:
-        state = r.get("verdict") or "?"
-        if r.get("released") is False:
-            state += " (STILL ATTACHED)"
-        cells = []
-        regs = r.get("regions") or {}
-        for key, _label in REGION_ORDER:
-            d = regs.get(key)
-            cells.append("%s/%s" % (d["ok"], d["ok"] + d["fail"]) if d else "-")
-        lines.append("%-16s %-13s %-8s %-9s %-8s %-8s %-8s %-10s %s" % (
-            r["ip"], state, *cells, "yes" if r.get("released") else "no", r.get("finished_at") or ""))
+    judged = [(r,) + judge_row(r) for r in rows]
+    tested = [x for x in judged if x[0].get("cycles")]
+    untested = [x[0] for x in judged if not x[0].get("cycles")]
+    servers = sorted({x[0].get("server") or "" for x in tested})
+    lines: List[str] = []
+    for srv in servers:
+        if len(servers) > 1:
+            lines += ["", "== server %s ==" % (srv or "?")]
+        lines.append(STATE_FMT % ("IP", "STATE", "WHY", "IRAN", "EUROPE", "USA", "ASIA", "OTHER", "LAST TEST"))
+        mine = [x for x in tested if (x[0].get("server") or "") == srv]
+        mine.sort(key=lambda x: (STATE_ORDER.index(x[1]) if x[1] in STATE_ORDER else len(STATE_ORDER),
+                                 _ip_key(x[0].get("ip"))))
+        for r, state, why in mine:
+            if r.get("released") is False:
+                why = ("STILL ATTACHED" + ("; " + why if why else ""))
+            regs = r.get("regions") or {}
+            cells = []
+            for key, _label in REGION_ORDER:
+                d = regs.get(key)
+                cells.append("%s/%s" % (d["ok"], d["ok"] + d["fail"]) if d else "-")
+            lines.append((STATE_FMT % (r["ip"], state, why[:32], *cells,
+                                       str(r.get("finished_at") or "").replace("T", " ")[:16])).rstrip())
     lines.append("")
-    lines.append("counts are reachable/tested nodes in that region for the latest test of the IP")
-    lines.append("STATE comes from the Iran group only: GOOD = mostly reachable, BAD = mostly blocked")
-    return "\n".join(lines)
+    for state in STATE_ORDER:
+        ips = sorted({x[0]["ip"] for x in tested if x[1] == state}, key=_ip_key)
+        if ips:
+            lines.append("%-5s %d: %s" % (state, len(ips), ", ".join(ips)))
+    gone = sorted({r["ip"] for r in untested if r.get("released") is not False}, key=_ip_key)
+    stuck = sorted({r["ip"] for r in untested if r.get("released") is False}, key=_ip_key)
+    if gone:
+        lines.append("not tested (released after an error): %s" % ", ".join(gone))
+    if stuck:
+        lines.append("STILL ATTACHED, not tested: %s  (run `%s cleanup --yes`, or remove it in the panel)"
+                     % (", ".join(stuck), PROJECT))
+    lines += ["",
+              "counts are reachable/tested nodes in that region, from the IP's latest test",
+              "GOOD = reachable from Iran AND from outside Iran",
+              "BAD  = Iran only (no node outside Iran reached it), or blocked in Iran (only outside did)"]
+    return "\n".join(lines).lstrip("\n")
 
 
 def save_state_file() -> str:
-    text = state_table(latest_per_ip(load_results()))
-    with contextlib.suppress(OSError):
-        os.makedirs(HOME_DIR, exist_ok=True)
-        with open(os.path.join(HOME_DIR, "state.txt"), "w", encoding="utf-8") as fh:
-            fh.write(text + "\n")
+    with IO_LOCK:
+        text = state_table(latest_per_ip(load_results()))
+        with contextlib.suppress(OSError):
+            os.makedirs(HOME_DIR, exist_ok=True)
+            with open(os.path.join(HOME_DIR, "state.txt"), "w", encoding="utf-8") as fh:
+                fh.write(text + "\n")
     return text
 
 
 def summary_table(rows: List[Dict[str, Any]]) -> str:
+    """One line per round. checks: one letter per check (R reachable, I Iran only,
+    B blocked in Iran, D down, ? unclear)."""
     if not rows:
         return "(no results)"
-    lines = ["%-20s %-16s %-5s %-16s %-12s %-5s %-6s %-8s %s" % (
-        "finished", "server", "round", "ip", "verdict", "r/b/d", "egress", "released", "regions")]
+    fmt = "%-20s %-16s %-5s %-16s %-12s %-6s %-8s %s"
+    lines = [fmt % ("finished", "server", "round", "ip", "verdict", "checks", "released", "regions / why")]
     for r in rows:
-        lines.append("%-20s %-16s %-5s %-16s %-12s %-5s %-6s %-8s %s" % (
-            r.get("finished_at") or "", r.get("server") or "-", r.get("round"), r.get("ip") or "-", r.get("verdict"),
-            "%s/%s/%s" % (r.get("reachable_cycles", "-"), r.get("blocked_cycles", "-"), r.get("down_cycles", "-")),
-            {True: "ok", False: "BAD", None: "-"}.get(r.get("egress_ok"), "-"),
-            r.get("released"), r.get("regions_text") or ""))
+        state, why = judge_row(r)
+        regions = regions_text(r.get("regions") or {}) or r.get("regions_text") or ""
+        lines.append((fmt % (r.get("finished_at") or "", r.get("server") or "-", r.get("round"),
+                             r.get("ip") or "-", state, checks_text(row_check_kinds(r)) or "-",
+                             r.get("released"),
+                             regions + ("   (%s)" % why if why and r.get("cycles") else ""))).rstrip())
         if r.get("error"):
             lines.append("      error: %s" % r["error"])
     return "\n".join(lines)
@@ -2392,6 +2642,68 @@ exit codes: 0 ok, 1 error, 2 aborted / something left pending, 4 interrupted
 """ % {"p": PROJECT}
 
 
+def run_parallel(cfgs: List[Dict[str, Any]]) -> int:
+    """Test every server at the same time: one worker thread per server. Each server runs its
+    own rounds; check-host requests from all of them are paced together. Ctrl-C asks every
+    worker to stop, and each one first releases the test IP it has attached."""
+    global PARALLEL_ACTIVE
+    agents: List[Agent] = []
+    codes: Dict[str, int] = {}
+    for c in cfgs:
+        ip = c["MANAGEMENT_IP"]
+        try:
+            agents.append(Agent(c, EventLog(c, tag=ip)))
+        except AgentError as exc:
+            print("error [%s]: %s" % (ip, exc), file=sys.stderr)
+            codes[ip] = 1
+
+    def work(agent: Agent) -> None:
+        ip = agent.cfg["MANAGEMENT_IP"]
+        try:
+            codes[ip] = agent.test(int(agent.cfg["ROUNDS"]), summary=False)
+        except AgentError as exc:
+            agent.log.error("server_failed", error=str(exc))
+            codes[ip] = 1
+        except StopRequested:
+            codes[ip] = 4
+        except Exception as exc:  # noqa: BLE001 - one server must not take the others down
+            agent.log.error("server_crashed", error="%s: %s" % (type(exc).__name__, exc))
+            codes[ip] = 1
+
+    print("testing %d servers at the same time: %s" % (len(agents), ", ".join(a.cfg["MANAGEMENT_IP"] for a in agents)))
+    threads = [threading.Thread(target=work, args=(ag,), name=ag.cfg["MANAGEMENT_IP"]) for ag in agents]
+    stopped = False
+    STOP.clear()
+    PARALLEL_ACTIVE = True
+    try:
+        for t in threads:
+            t.start()
+        while any(t.is_alive() for t in threads):
+            for t in threads:
+                t.join(0.5)
+    except KeyboardInterrupt:
+        stopped = True
+        with IO_LOCK:
+            print("\nCtrl-C: stopping every server. Attached test IPs are released first; "
+                  "this can take a few minutes ...", flush=True)
+        STOP.set()
+        for t in threads:           # a second Ctrl-C ends the wait; the workers still finish releasing
+            if t.ident is not None:
+                t.join()
+    PARALLEL_ACTIVE = False
+    STOP.clear()
+    rows = [r for ag in agents for r in getattr(ag, "last_rows", [])]
+    rows.sort(key=lambda r: (r.get("finished_at") or "", r.get("server") or ""))
+    print("\n" + summary_table(rows))
+    save_state_file()
+    pending = [ag.cfg["MANAGEMENT_IP"] for ag in agents if State(ag.cfg["MANAGEMENT_IP"]).pending]
+    if pending:
+        print("\n!! an allocation is still pending on %s: run `%s cleanup --yes`" % (", ".join(pending), PROJECT))
+    print("results: %s  (table: `%s state`, file: %s)"
+          % (os.path.join(HOME_DIR, "results.csv"), PROJECT, os.path.join(HOME_DIR, "state.txt")))
+    return max([4 if stopped else 0, 2 if pending else 0] + list(codes.values()))
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog=PROJECT, description=__doc__.split("\n\n")[0].strip(),
                                  epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2417,6 +2729,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--check-port", type=int)
     p.add_argument("--no-baseline", action="store_true")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--sequential", action="store_true",
+                   help="several management IPs: test one server after another, not all at once")
     p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     p = sub.add_parser("cleanup", help="release a test IP left behind by a crash")
     p.add_argument("--yes", action="store_true")
@@ -2430,7 +2744,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     a = ap.parse_args(argv)
     a.server_id_check = bool(getattr(a, "server_id", None))
     for name in ("server_id", "management_ip", "rounds", "checks_per_ip", "check_type", "check_port",
-                 "no_baseline", "dry_run", "yes", "bad", "good", "last"):
+                 "no_baseline", "dry_run", "sequential", "yes", "bad", "good", "last"):
         if not hasattr(a, name):
             setattr(a, name, None)
     if not a.cmd:
@@ -2443,7 +2757,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                           "SSH_PORT": a.ssh_port, "LOG_LEVEL": "debug" if a.verbose else None}
     if a.cmd == "test":
         ov.update(ROUNDS=a.rounds, CHECKS_PER_IP=a.checks_per_ip, CHECK_TYPE=a.check_type,
-                  CHECK_PORT=a.check_port, BASELINE_CHECK=False if a.no_baseline else None)
+                  CHECK_PORT=a.check_port, BASELINE_CHECK=False if a.no_baseline else None,
+                  PARALLEL=False if a.sequential else None)
     if a.cmd == "init":
         ov["SERVER_ID"] = a.server_id
         ov["MANAGEMENT_IP"] = a.management_ip
@@ -2454,20 +2769,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             rows = latest_per_ip(load_results())
             if a.server:
                 rows = [r for r in rows if r.get("server") in parse_ip_list(a.server)]
-            text = state_table(rows)
-            print(text)
-            with contextlib.suppress(OSError):
-                os.makedirs(HOME_DIR, exist_ok=True)
-                with open(os.path.join(HOME_DIR, "state.txt"), "w", encoding="utf-8") as fh:
-                    fh.write(text + "\n")
+                print(state_table(rows))
+            else:
+                print(save_state_file())
                 print("\nsaved: %s" % os.path.join(HOME_DIR, "state.txt"))
+                rewrite_csv()                      # keep results.csv in step with the current rules
             return 0
         if a.cmd == "results":
             rows = load_results()
             if a.bad:
-                rows = [r for r in rows if r.get("verdict") == "BAD"]
+                rows = [r for r in rows if judge_row(r)[0] == "BAD"]
             if a.good:
-                rows = [r for r in rows if r.get("verdict") == "GOOD"]
+                rows = [r for r in rows if judge_row(r)[0] == "GOOD"]
             if a.server:
                 rows = [r for r in rows if r.get("server") in parse_ip_list(a.server)]
             if a.last:
@@ -2506,12 +2819,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         if a.cmd == "cleanup" and not a.yes:
             print("cleanup changes the server(s): re-run with --yes")
             return 1
-        if a.cmd == "test" and not a.dry_run and not a.yes:
+        real_test = a.cmd == "test" and not a.dry_run
+        parallel = (real_test and len(cfgs) > 1 and bool(base["PARALLEL"])
+                    and all(c["VM_CONFIG_MODE"] == "panel" for c in cfgs))
+        if real_test and len(cfgs) > 1 and bool(base["PARALLEL"]) and not parallel:
+            print("note: vm_config_mode is ssh, so the servers are tested one after another")
+        if real_test and not a.yes:
             rounds = sum(int(c["ROUNDS"]) for c in cfgs)
-            ans = input("This allocates and releases %d billable public IPv4(s) on %d server(s) (%s). "
-                        "Continue? [y/N] " % (rounds, len(cfgs), ", ".join(sel)))
+            ans = input("This allocates and releases %d billable public IPv4(s) on %d server(s) (%s)%s. "
+                        "Continue? [y/N] " % (rounds, len(cfgs), ", ".join(sel),
+                                              ", all servers at the same time" if parallel else ""))
             if ans.strip().lower() not in ("y", "yes"):
                 return 1
+        if parallel:
+            return run_parallel(cfgs)
+        if (a.cmd == "test" and a.dry_run and len(cfgs) > 1 and bool(base["PARALLEL"])
+                and all(c["VM_CONFIG_MODE"] == "panel" for c in cfgs)):
+            print("note: a real run tests these %d servers at the same time" % len(cfgs))
         rc = 0
         for c in cfgs:
             if len(cfgs) > 1:
