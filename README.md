@@ -1,8 +1,8 @@
 # arvin-agent-badip
 
-`arvin-agent-badip` finds out whether the public IPv4 addresses ArvanCloud gives your server are **reachable from Iran (GOOD)** or **blocked (BAD)**. Each run allocates a test IP, tests it, releases it, and saves the result. It does this `ROUNDS` times (5 by default).
+`arvin-agent-badip` finds out whether the public IPv4 addresses ArvanCloud gives your server are **GOOD** (reachable from Iran and from outside Iran) or **BAD** (reachable from one side only). Each run allocates a test IP, tests it, releases it, and saves the result. It does this `ROUNDS` times (5 by default).
 
-The tool is one file, `arvin_agent_badip.py`, and needs only the Python 3.8+ standard library. It runs on **your Mac**, not on the server. It can test **several servers** in one run: list their management IPs separated by commas.
+The tool is one file, `arvin_agent_badip.py`, and needs only the Python 3.8+ standard library. It runs on **your Mac**, not on the server. It can test **several servers** in one run: list their management IPs separated by commas, and they are tested at the same time.
 
 | Credential | Gives access to | Used for |
 |---|---|---|
@@ -28,7 +28,7 @@ Only the API key is needed. `ssh_user` and `ssh_key` are ignored.
 
 ## What one round does (ssh mode)
 
-1. **Allocate:** `POST /servers/{id}/add-public-ip` with an empty body. This is billable. The pending allocation is written to `state.json` *before* the request is sent. The reply carries no port details, so the new port is found by comparing the port list from `GET /networks` with the one saved before the request.
+1. **Allocate:** `POST /servers/{id}/add-public-ip` with the firewall named by `firewall_name`. This is billable. The pending allocation is written to `state.json` *before* the request is sent. The reply carries no port details, so the new port is found by comparing the port list from `GET /networks` with the one saved before the request.
 2. **Configure (SSH + sudo):**
    - It waits for the new port to show up in `GET /networks` with its MAC, and for its NIC (matched by MAC) to appear in the VM.
    - It adds the address and a source policy route (`from <test-ip> lookup 2100`).
@@ -44,18 +44,6 @@ Only the API key is needed. `ssh_user` and `ssh_key` are ignored.
 Before the first round, the management IP's replies are pinned to its own NIC with a policy route (`from <mgmt-ip> lookup 2099`). A new NIC therefore can't take over your SSH return path. The pin is confirmed with a **fresh** SSH connection. If that confirmation fails, a watchdog inside the VM undoes the pin after 90 s. The pin is removed at the end of the run.
 
 **Guard on the server:** on this ArvanCloud image, adding an IP can cut the management connection until the IP is removed, because the server's network service reconfigures when the new card appears. During a test a small guard loop runs on the server itself. Every second it restores the management rule and route and the test IP's rule and route, and removes a default route through the test card. It stops by itself 15 minutes after the last heartbeat from your computer (`mgmt_guard_life_sec`), and at the end of every run. SSH commands are retried (`ssh_retries`) instead of failing on the first lost connection.
-
-**Per-IP verdicts** (computed from that IP's cycles):
-
-| Verdict | Meaning |
-|---|---|
-| `GOOD` | more cycles reachable than blocked |
-| `BAD` | more cycles blocked than reachable |
-| `MIXED` | equal numbers of reachable and blocked cycles |
-| `UNTESTABLE` | down from outside Iran too, so it's an OS, firewall or security-group problem |
-| `INCONCLUSIVE` | not enough Iranian nodes answered |
-
-Each run also probes the management IP once and saves it as `MGMT-…` (round 0) for comparison.
 
 ## Setup (macOS)
 
@@ -107,9 +95,14 @@ Everything else is optional: `api_key`, `server_id`, `rounds`, `checks_per_ip`, 
 A value written into the YAML file is stored in plain text, so `chmod 600` the file. If `api_key` is empty, the key comes from `$ARVAN_API_KEY`, then `~/arvin-agent-badip/api_key`, then the Keychain. If `ssh_key` is empty, any key in the agent is tried. (`api_key_file` and `ssh_pubkey` still work as older names.)
 
 **Several servers:**
-- Every command runs over each management IP in turn. `--server IP` limits a command to one of them.
+- `test` runs all servers **at the same time** (panel mode). Each server does its own rounds, and every output line starts with that server's management IP.
+- `test --sequential`, or `parallel: false` in the YAML file, tests one server after another. `vm_config_mode: ssh` is always one after another.
+- check-host.net requests are paced. Two checks of the same IP are `check_spacing_sec` (60 s) apart, and all servers together send at most one request per `checkhost_min_spacing_sec` (30 s). One server alone therefore sends one request a minute, and several servers interleave theirs.
+- In a simulation with the timings of a real run, 2 servers finished 1.9× faster than one after another, 3 servers 2.4×, and 5 servers 3.0×. It is not N× because the servers share the check-host queue.
+- check-host's limits are not documented. If it starts refusing requests, the script waits 2 minutes and that check may come out unclear; set `checkhost_min_spacing_sec: 60` in that case.
+- **Ctrl-C** stops every server. Each one first releases the test IP it has attached.
+- The other commands (`init`, `preflight`, `cleanup`, ...) go through the servers one after another. `--server IP` limits any command to one of them.
 - `server_id` is optional. If you set it, give one UUID per IP, in the same order.
-- `test` stops before the next server if an IP is left pending.
 - Results get a `server` column.
 
 Values override in this order, lowest first: script defaults, then what `init` discovered, then the YAML file, then command-line flags. An empty value keeps the default.
@@ -122,13 +115,29 @@ With a `.pub` key, ssh asks the agent for exactly that key (`IdentitiesOnly=yes`
 
 ## Results at a glance
 
-Every check runs from several regions at once. The GOOD/BAD verdict comes from the **Iran** group only. Europe, USA, Asia and other regions are shown for comparison. The management IP is not tested or judged; it is only used to reach the server.
+Every check runs from Iran and from several other regions at once (Europe, USA, Asia, other). An IP is judged from both sides:
+
+| State | Meaning |
+|---|---|
+| `GOOD` | reachable from Iran **and** from outside Iran |
+| `BAD`, Iran only | Iran reaches it, but not a single node outside Iran does |
+| `BAD`, blocked in Iran | nodes outside Iran reach it, but Iran does not |
+| `DOWN` | no region reaches it: a fault on the server or in the network, not a block |
+| `MIXED` | the checks of that IP disagree |
+| `INCONCLUSIVE` | too few nodes answered |
+
+- **Checks per IP:** each IP is checked `checks_per_ip` times (2 by default). A state needs more than half of the checks that gave a clear answer. With 2 checks both must agree, otherwise the IP is `MIXED`. `checks_per_ip: 3` gives fewer `MIXED` results.
+- **"Not a single node outside Iran"** is `outside_min_ok: 1` in the YAML file. A larger number is stricter, and `0` turns the Iran-only rule off.
+- **"Iran reaches it"** means at most half of the Iranian nodes failed (`fail_ratio_threshold`).
+- **The management IP** is not tested or judged.
 
 ```sh
-python3 arvin_agent_badip.py state     # one line per IP: STATE, then IRAN / EUROPE / USA / ASIA / OTHER counts
+python3 arvin_agent_badip.py state     # one line per IP: STATE, WHY, then IRAN / EUROPE / USA / ASIA / OTHER counts
 ```
 
-`state` is also saved to `~/arvin-agent-badip/state.txt`, so you can open it at any time. A counts column such as `EUROPE 2/3` means 2 of 3 European nodes reached the IP. `(STILL ATTACHED)` means the IP is still on the server and needs removing in the panel.
+`state` lists GOOD IPs first, then BAD, then the rest, and ends with one line per state listing its IPs. It is also saved to `~/arvin-agent-badip/state.txt`. A counts column such as `EUROPE 2/3` means 2 of 3 European nodes reached the IP. `STILL ATTACHED` means the IP is still on the server and needs removing in the panel.
+
+Saved results are judged again with the current rules every time they are shown, so changing a rule does not need a new test. `results.csv` is rebuilt from `results.jsonl` the same way.
 
 Regions are set by `probe_regions` in the YAML file (check-host node country codes). `probe_per_region` sets how many nodes each region uses.
 
@@ -147,7 +156,9 @@ Regions are set by `probe_regions` in the YAML file (check-host node country cod
 ./arvin_agent_badip.py cleanup --yes          # release a test IP left behind by a crash
 ```
 
-Useful flags for `test`: `--checks-per-ip N`, `--check-type tcp|ping|http`, `--check-port P` (only if a service listens on all addresses on that port), and `--no-baseline`.
+Useful flags for `test`: `--checks-per-ip N`, `--check-type tcp|ping|http`, `--check-port P` (only if a service listens on all addresses on that port), and `--sequential`.
+
+The default check is a TCP connection to port 22. `--check-type ping` (or `check_type: ping`) uses ICMP ping instead; the firewall must then allow ping.
 
 Exit codes: `0` ok · `1` error · `2` the run stopped early, or something is still pending · `4` interrupted.
 
@@ -161,29 +172,28 @@ Exit codes: `0` ok · `1` error · `2` the run stopped early, or something is st
 | `servers/<ip>/config.json` | per server: server ID, management port, NIC, gateway (written by `init`) |
 | `servers/<ip>/state.json` | per server: the allocation in flight (if any) |
 | `keys/` | key files written from key *values* given in the YAML file |
-| `results.csv` / `results.jsonl` | one row per tested IP: verdict, cycle counts, egress check, TCP check from the Mac, `seen_before` (Arvan handed out the same IP again), check-host report links |
+| `state.txt` | the `state` table: one line per IP |
+| `results.jsonl` | the record: one row per tested IP, with every check, the per-region counts and the check-host report links |
+| `results.csv` | the same rows for a spreadsheet: verdict, reason, one letter per check (`R` reachable, `I` Iran only, `B` blocked in Iran, `D` down, `?` unclear), `seen_before` (Arvan handed out the same IP again) |
 | `checks.jsonl` | every check-host cycle, with per-node results |
 | `events.jsonl` | every action |
 
-## Not verified yet
+## What has and has not been verified
 
-This has **not** been run against the real ArvanCloud API. It passes a mock end-to-end test (`python3 tests/test_mock.py`), which covers:
-- 5 rounds
-- a lost allocation reply
-- a crash with an IP left pending, then `cleanup`
+**Run on a real ArvanCloud account (panel mode, one server):** `init`, `preflight`, and full rounds: add an IP with a firewall, wait for the panel, test from every region, release, management back.
 
-These assumptions are carried over from the earlier rotator work:
+**Only tested against mocks** (`python3 tests/test_mock.py`):
+- several servers at the same time, and Ctrl-C during such a run
+- `vm_config_mode: ssh` end to end
+- Windows
 
-- The v1 endpoints come from ArvanCloud's Terraform provider source (`arvancloud/terraform-provider-arvan`, last updated in 2023). They are not in the published v3 reference:
-  - `POST /servers/{id}/add-public-ip`, empty body
+Things to know:
+
+- The API calls come from ArvanCloud's Terraform provider source (`arvancloud/terraform-provider-arvan`, last updated in 2023) and from what the real API answered. They are not in the published v3 reference:
+  - `POST /servers/{id}/add-public-ip` with `{"type": "ipv4", "security_groups": [firewall id]}`
   - `PATCH /networks/{port_id}/detach` with `{"server_id": …}`
   - `GET /networks`, where `subnets[].servers[].ips[]` lists each port's IP, MAC and port ID
-- The provider only uses `detach` on ports it attached itself, so releasing a port made by `add-public-ip` this way is still unconfirmed. After every release the script checks that the management IP is still listed.
-- It's unknown whether detaching **frees the IPv4 and stops billing**. Check the panel and your billing after the first round.
-- The new IP is assumed to arrive as a **hot-plugged NIC**. If no NIC appears within 120 s, the round records an error and the IP is still released.
-- Pricing: each additional IPv4 is €2.83/month. It's unknown whether a few minutes are billed pro-rata.
-- Caps: 4 IPs per server and 15 per account. You can't choose which IP you get, and Arvan may hand out the same IP again (shown as `seen_before`).
-- check-host.net results are public, and its Iranian nodes may not match what your users see.
+- It's unknown whether a few minutes of an extra IPv4 are billed pro-rata. Each additional IPv4 is €2.83/month.
+- Caps: 4 IPs per server and 15 per account. During a parallel run every server holds two IPs at once (its management IP and a test IP), so more than 7 servers can hit the account cap; ArvanCloud then refuses that server's request and only that server stops. You can't choose which IP you get, and Arvan may hand out the same IP again (shown as `seen_before`).
+- check-host.net results are public, its rate limits are not documented, and its Iranian nodes may not match what your users see.
 - Repeatedly allocating and releasing IPs may be limited by ArvanCloud's ToS or abuse detection. Check before running large batches.
-
-The original rotator (`arvan-ip-rotator.zip`) is unchanged.

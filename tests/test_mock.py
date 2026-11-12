@@ -162,6 +162,7 @@ def fake_cycle(self, ip, purpose):
 
 
 ORIG_CYCLE, ORIG_PROBE = m.Reachability.cycle, m.CheckHost.probe_nodes
+ORIG_RUN, ORIG_SUBMIT = m.CheckHost.run, m.CheckHost.submit
 m.Reachability.cycle = fake_cycle
 m.CheckHost.probe_nodes = lambda self: ["ir1", "ir2", "ir3"]
 
@@ -360,23 +361,81 @@ except m.AbortRun as e:
     print("rejected:", str(e)[:80])
 print("FIREWALL OK")
 
-# ---- regions, state table ---------------------------------------------------------------------
+# ---- regions, verdict rules, re-judging of saved results, state table ---------------------------
 regs = {"iran": {"ok": 3, "fail": 0, "unknown": 0}, "europe": {"ok": 2, "fail": 1, "unknown": 0}}
 assert m.regions_text(regs) == "IR 3/3  EU 2/3", m.regions_text(regs)
-rows_s = [{"server": S1, "ip": "1.1.1.1", "round": 1, "verdict": "BAD", "regions": regs,
-           "released": True, "finished_at": "t1"},
-          {"server": S1, "ip": "1.1.1.1", "round": 2, "verdict": "GOOD", "regions": regs,
-           "released": True, "finished_at": "t2"},
-          {"server": S1, "ip": "2.2.2.2", "round": 1, "verdict": "BAD", "regions": {},
-           "released": False, "finished_at": "t3"},
+
+R_, I_, B_, D_, Q_ = m.REACHABLE, m.IRAN_ONLY, m.BLOCKED, m.DOWN, m.INCONCLUSIVE
+agg = m.aggregate_verdict
+assert agg([R_, R_]) == ("GOOD", "")
+assert agg([I_, I_]) == ("BAD", "Iran only")
+assert agg([B_, B_]) == ("BAD", "blocked in Iran")
+assert agg([I_, B_]) == ("BAD", "Iran only / blocked in Iran")
+assert agg([D_, D_]) == ("DOWN", "no region reached it")
+assert agg([R_, D_]) == ("MIXED", "checks disagree: reachable, down")
+assert agg([R_, I_])[0] == "MIXED" and agg([R_, B_])[0] == "MIXED"
+assert agg([R_, Q_]) == ("GOOD", "") and agg([Q_, Q_])[0] == "INCONCLUSIVE"
+assert agg([R_, R_, D_])[0] == "GOOD" and agg([I_, I_, R_])[0] == "BAD" and agg([D_, D_, R_])[0] == "DOWN"
+assert m.checks_text([R_, I_, B_, D_, Q_]) == "RIBD?"
+
+
+def old_row(ip, checks, regions, rnd=1, released=True, t="2026-11-11T14:26:12Z"):
+    """A result as it was saved BEFORE the Iran-only rule: a check is REACHABLE whenever Iran
+    reached the IP, and only control_ok says how many nodes outside Iran did."""
+    return {"server": S1, "ip": ip, "round": rnd, "verdict": "GOOD", "released": released, "finished_at": t,
+            "cycles": [{"verdict": v, "ok": 7, "fail": 0, "control_ok": c} for v, c in checks],
+            "regions": {k: {"ok": o, "fail": f, "unknown": 0} for k, (o, f) in regions.items()}}
+
+
+# the five IPs of a real run, as they were stored (all "GOOD" at the time)
+iran_only = {"iran": (14, 0), "europe": (0, 34), "usa": (0, 6), "asia": (0, 8), "other": (0, 8)}
+world = {"iran": (14, 0), "europe": (33, 2), "usa": (6, 0), "asia": (7, 1), "other": (8, 0)}
+flaky = {"iran": (4, 10), "europe": (9, 27), "usa": (1, 5), "asia": (3, 5), "other": (4, 4)}
+rows_s = [old_row("37.32.26.100", [(R_, 0), (R_, 0)], iran_only),
+          old_row("37.32.26.26", [(R_, 0), (R_, 0)], iran_only),
+          old_row("95.38.187.230", [(R_, 17), (D_, 0)], flaky),
+          old_row("37.32.26.66", [(R_, 27), (R_, 27)], world),
+          old_row("37.32.27.127", [(R_, 0), (R_, 0)], iran_only, released=False),
+          {"server": S1, "ip": "94.101.185.166", "round": 1, "verdict": "ERROR", "released": True,
+           "error": "released by cleanup", "finished_at": "t"},
           {"server": S1, "ip": S1, "round": 0, "verdict": "MGMT-GOOD"}]
+assert m.judge_row(rows_s[0]) == ("BAD", "Iran only"), m.judge_row(rows_s[0])
+assert m.judge_row(rows_s[2]) == ("MIXED", "checks disagree: reachable, down")
+assert m.judge_row(rows_s[3]) == ("GOOD", "")
+assert m.judge_row(rows_s[5]) == ("ERROR", "released by cleanup")
+m.RULES["OUTSIDE_MIN_OK"] = 0                                  # rule off: Iran alone decides again
+assert m.judge_row(rows_s[0]) == ("GOOD", "")
+m.RULES["OUTSIDE_MIN_OK"] = 1
+# a result with no evidence from outside Iran keeps what was stored
+assert m.judge_row(old_row("9.9.9.9", [(R_, 0)], {"iran": (7, 0)})) == ("GOOD", "")
+# a later "released by cleanup" row does not hide an earlier real test of the same IP
+both = [rows_s[3], {"server": S1, "ip": "37.32.26.66", "round": 2, "verdict": "ERROR", "released": True}]
+assert m.latest_per_ip(both)[0].get("cycles")
+
+# a tested IP left attached, then released by `cleanup` later: no longer shown as attached
+later = rows_s + [{"server": S1, "ip": "37.32.27.127", "round": 5, "verdict": "ERROR", "released": True,
+                   "error": "released by cleanup", "finished_at": "t9"}]
+row_127 = [r for r in m.latest_per_ip(later) if r["ip"] == "37.32.27.127"][0]
+assert row_127["released"] is True and row_127.get("cycles") and m.judge_row(row_127)[0] == "BAD"
+assert "STILL ATTACHED" not in m.state_table(m.latest_per_ip(later))
+# an IP left attached before it could be tested is reported as attached, not as released
+stuck = [{"server": S1, "ip": "5.5.5.5", "round": 1, "verdict": "ERROR", "released": False, "error": "x"}]
+st_stuck = m.state_table(m.latest_per_ip(stuck))
+assert "STILL ATTACHED, not tested: 5.5.5.5" in st_stuck and "released after an error" not in st_stuck, st_stuck
+
 latest = m.latest_per_ip(rows_s)
-assert [r["ip"] for r in latest] == ["1.1.1.1", "2.2.2.2"] and latest[0]["verdict"] == "GOOD"
+assert S1 not in [r["ip"] for r in latest] and len(latest) == 6
 st = m.state_table(latest)
-assert "STILL ATTACHED" in st and "3/3" in st and S1 not in st.split("\n")[1], st
+print(st)
+lines_st = st.split("\n")
+assert lines_st[1].startswith("37.32.26.66") and " GOOD " in lines_st[1], lines_st[1]      # GOOD first
+assert [l.split()[1] for l in lines_st[2:5]] == ["BAD", "BAD", "BAD"] and "Iran only" in lines_st[2]
+assert "STILL ATTACHED" in st and "0/34" in st and "33/35" in st
+assert "GOOD  1: 37.32.26.66" in st and "BAD   3: 37.32.26.26, 37.32.26.100, 37.32.27.127" in st
+assert "MIXED 1: 95.38.187.230" in st and "not tested (released after an error): 94.101.185.166" in st
 print("STATE OK")
 
-# ---- one check reaches every region; the verdict uses Iran only -------------------------------
+# ---- one check reaches every region; GOOD needs Iran AND outside Iran ----------------------------
 fake_nodes = {"ir1.node": {"location": ["ir"]}, "ir2.node": {"location": ["ir"]}, "ir3.node": {"location": ["ir"]},
               "de1.node": {"location": ["de"]}, "us1.node": {"location": ["us"]}, "sg1.node": {"location": ["sg"]}}
 m.Reachability.cycle, m.CheckHost.probe_nodes = ORIG_CYCLE, ORIG_PROBE
@@ -386,10 +445,10 @@ logr = m.EventLog(cr, quiet=True)
 chr_ = m.CheckHost(cr, m.Http(cr, logr), logr)
 chr_.nodes = lambda: fake_nodes
 seen_nodes = []
+failing = {"de1.node"}                                   # which nodes cannot reach the IP
 def fake_run(self, ctype, host, nodes):
     seen_nodes.extend(nodes)
-    raw = {n: [{"time": 0.1, "address": "x"}] for n in nodes}
-    raw["de1.node"] = [{"error": "timeout"}]              # Europe fails
+    raw = {n: ([{"error": "timeout"}] if n in failing else [{"time": 0.1, "address": "x"}]) for n in nodes}
     return raw, nodes, "https://check-host.net/check-report/y"
 m.CheckHost.run = fake_run
 m.CheckHost.submit = None
@@ -398,7 +457,25 @@ res = reach.cycle(S1, "test")
 assert set(seen_nodes) == {"ir1.node", "ir2.node", "ir3.node", "de1.node", "us1.node", "sg1.node"}, seen_nodes
 assert res["by_region"]["iran"] == {"ok": 3, "fail": 0, "unknown": 0}, res["by_region"]
 assert res["by_region"]["europe"] == {"ok": 0, "fail": 1, "unknown": 0}, res["by_region"]
-assert res["verdict"] == "REACHABLE", res["verdict"]           # Iran only decides
+assert res["verdict"] == "REACHABLE" and res["outside_ok"] == 2 and res["outside_fail"] == 1, res
+# Iran reaches it, nobody outside Iran does -> Iran only (bad)
+failing.clear(); failing.update({"de1.node", "us1.node", "sg1.node"})
+res = reach.cycle(S1, "test")
+assert res["verdict"] == "IRAN_ONLY" and res["outside_ok"] == 0 and res["outside_fail"] == 3, res
+# one single node outside Iran is enough to not be "Iran only"
+failing.clear(); failing.update({"de1.node", "us1.node"})
+assert reach.cycle(S1, "test")["verdict"] == "REACHABLE"
+# the rule can be turned off
+cr["OUTSIDE_MIN_OK"] = 0
+failing.clear(); failing.update({"de1.node", "us1.node", "sg1.node"})
+assert reach.cycle(S1, "test")["verdict"] == "REACHABLE"
+cr["OUTSIDE_MIN_OK"] = 1
+# outside reaches it, Iran does not -> blocked in Iran (bad)
+failing.clear(); failing.update({"ir1.node", "ir2.node", "ir3.node"})
+assert reach.cycle(S1, "test")["verdict"] == "BLOCKED"
+# nobody reaches it -> down
+failing.update({"de1.node", "us1.node", "sg1.node"})
+assert reach.cycle(S1, "test")["verdict"] == "DOWN"
 print("REGIONS OK")
 
 # ---- DOWN verdict: diagnostics are collected before the release ---------------------------------
@@ -409,7 +486,7 @@ C = yaml("management_ip: %s\n" % S1)
 nd = len(cloud["srv1"].detached)
 assert m.main(C + ["test", "--yes", "--rounds", "1"]) == 0
 last = m.load_results()[-1]
-assert last["verdict"] == "UNTESTABLE" and len(last["cycles"]) == 1 and os.path.isfile(last["diag_file"]), last
+assert last["verdict"] == "DOWN" and len(last["cycles"]) == 1 and os.path.isfile(last["diag_file"]), last
 assert len(cloud["srv1"].detached) == nd + 1 and "ping gateway" in [s for _, _, s in scripts if s and "rp_filter" in s][-1]
 print("DIAG OK")
 
@@ -438,6 +515,213 @@ m.Reachability.cycle = lambda self, ip, purpose: {"verdict": "DOWN", "why": "moc
                                                   "by_region": {"iran": {"ok": 0, "fail": 5, "unknown": 0}}}
 assert m.main(C + ["test", "--yes", "--rounds", "1"]) == 0
 last = m.load_results()[-1]
-assert last["verdict"] == "UNTESTABLE" and len(last["cycles"]) == 2 and last["released"] is True, last
+assert last["verdict"] == "DOWN" and len(last["cycles"]) == 2 and last["released"] is True, last
 assert len(scripts) == n_ssh
 print("PANEL OK")
+
+# ---- results.csv is rebuilt from results.jsonl: same columns in every row, current rules -------------
+import csv as _csv
+with open(os.path.join(home, "results.csv"), newline="", encoding="utf-8") as fh:
+    rd = _csv.reader(fh)
+    header = next(rd)
+    body = list(rd)
+all_rows = m.load_results()
+assert header == m.RESULT_FIELDS and len(body) == len(all_rows), (len(body), len(all_rows))
+assert all(len(r) == len(header) for r in body)
+vcol, rcol = header.index("verdict"), header.index("reason")
+assert [(r[vcol], r[rcol]) for r in body] == [m.judge_row(r) for r in all_rows]
+print("CSV OK")
+
+# ---- nap(): a worker is woken once by a stop request; a release is shielded from it -----------------
+import threading
+out_nap = {}
+
+
+def nap_once():
+    try:
+        m.nap(5)
+        out_nap["first"] = "slept"
+    except m.StopRequested:
+        out_nap["first"] = "woken"
+    m.nap(5)                                   # the same worker is not interrupted a second time
+    out_nap["second"] = "slept"
+
+
+def nap_shielded():
+    with m.shielded():
+        m.nap(5)
+        out_nap["shielded"] = "slept"
+    try:
+        m.nap(1)
+        out_nap["after"] = "slept"
+    except m.StopRequested:
+        out_nap["after"] = "woken"
+
+
+m.PARALLEL_ACTIVE = True
+m.STOP.set()
+for fn in (nap_once, nap_shielded):
+    th = threading.Thread(target=fn)
+    th.start()
+    th.join(10)
+m.PARALLEL_ACTIVE = False
+m.STOP.clear()
+assert out_nap == {"first": "woken", "second": "slept", "shielded": "slept", "after": "woken"}, out_nap
+m.nap(0)                                       # outside a parallel run it is an ordinary sleep
+print("NAP OK")
+
+# ---- several servers are tested at the same time (panel mode) -----------------------------------------
+import contextlib as _ctx
+import io as _io
+barrier = threading.Barrier(2, timeout=20)     # both servers must be inside a check at the same moment
+met, calls, call_lock = set(), [], threading.Lock()
+
+
+def par_cycle(self, ip, purpose):
+    me = threading.current_thread().name
+    with call_lock:
+        calls.append((me, ip))
+        first = me not in met
+        met.add(me)
+    if first:
+        barrier.wait()                         # times out (and fails the test) if the run is sequential
+    return dict(good)
+
+
+m.Reachability.cycle = par_cycle
+C = yaml('management_ip: "%s, %s"\nrounds: 3\n' % (S1, S2))
+assert m.main(C + ["init"]) == 0
+c2 = cloud["srv2"]
+n1, n2, rows0 = len(c1.detached), len(c2.detached), len(m.load_results())
+buf = _io.StringIO()
+with _ctx.redirect_stdout(buf):
+    rc = m.main(C + ["test", "--yes"])
+text = buf.getvalue()
+assert rc == 0, text[-1500:]
+assert "testing 2 servers at the same time" in text
+assert "[%s] " % S1 in text and "[%s] " % S2 in text          # every line says which server it is about
+assert len(c1.detached) == n1 + 3 and len(c2.detached) == n2 + 3
+assert [p["id"] for p in c1.ports] == ["p-mgmt-srv1"] and [p["id"] for p in c2.ports] == ["p-mgmt-srv2"]
+new_rows = m.load_results()[rows0:]
+assert len(new_rows) == 6 and sorted(r["server"] for r in new_rows) == [S1] * 3 + [S2] * 3, new_rows
+assert all(r["verdict"] == "GOOD" and r["released"] is True for r in new_rows)
+assert {name for name, _ in calls} == {S1, S2}                # one worker thread per server
+assert all(ip.startswith("185.1.1.") == (name == S1) for name, ip in calls)   # each tests its own IPs
+assert not m.State(S1).pending and not m.State(S2).pending
+with open(os.path.join(home, "results.jsonl"), encoding="utf-8") as fh:        # no torn lines
+    assert all(json.loads(line) for line in fh)
+
+# --sequential: one server after another, in the main thread
+calls.clear()
+m.Reachability.cycle = lambda self, ip, purpose: (calls.append((threading.current_thread().name, ip)), dict(good))[1]
+buf = _io.StringIO()
+with _ctx.redirect_stdout(buf):
+    rc = m.main(C + ["test", "--yes", "--sequential", "--rounds", "1"])
+assert rc == 0 and "at the same time" not in buf.getvalue()
+assert {name for name, _ in calls} == {"MainThread"} and len(calls) == 4
+print("PARALLEL OK")
+
+# ---- Ctrl-C in a parallel run: every server stops, and releases its test IP first -------------------
+import _thread
+fired = []
+
+
+def stop_cycle(self, ip, purpose):
+    with call_lock:
+        first = not fired
+        fired.append(ip)
+    if first:
+        _thread.interrupt_main()               # as if Ctrl-C was pressed during this check
+        assert m.STOP.wait(30), "the main thread never asked the workers to stop"
+    return dict(good)
+
+
+m.Reachability.cycle = stop_cycle
+n1, n2 = len(c1.detached), len(c2.detached)
+buf = _io.StringIO()
+with _ctx.redirect_stdout(buf):
+    rc = m.main(C + ["test", "--yes", "--rounds", "50"])
+text = buf.getvalue()
+assert rc == 4, (rc, text[-1500:])
+assert "Ctrl-C: stopping every server" in text
+assert [p["id"] for p in c1.ports] == ["p-mgmt-srv1"] and [p["id"] for p in c2.ports] == ["p-mgmt-srv2"], text[-1500:]
+assert not m.State(S1).pending and not m.State(S2).pending
+done = (len(c1.detached) - n1) + (len(c2.detached) - n2)
+assert 1 <= done < 100, done                   # it stopped long before the 50 rounds per server
+assert not m.PARALLEL_ACTIVE and not m.STOP.is_set()
+print("PARALLEL STOP OK")
+
+# ---- Ctrl-C between the request for an IP and the API listing it: it is found and released ----------
+orig_find = m.Agent._find_new_port
+state_find = {"n": 0}
+
+
+def slow_find(self, ports_before):
+    state_find["n"] += 1
+    if state_find["n"] == 1:
+        raise KeyboardInterrupt            # Ctrl-C while the script waits for the new IP to be listed
+    return orig_find(self, ports_before)
+
+
+m.Agent._find_new_port = slow_find
+m.Reachability.cycle = lambda self, ip, purpose: dict(good)
+C = yaml("management_ip: %s\n" % S1)
+nd = len(c1.detached)
+rc = m.main(C + ["test", "--yes", "--rounds", "3"])
+m.Agent._find_new_port = orig_find
+assert rc == 4, rc
+assert len(c1.detached) == nd + 1 and [p["id"] for p in c1.ports] == ["p-mgmt-srv1"]   # found and released
+assert not m.State(S1).pending
+print("STOP WINDOW OK")
+
+# ---- check-host pacing: one queue for all servers; two checks of one IP are further apart ------------
+m.CheckHost.run, m.CheckHost.submit = ORIG_RUN, ORIG_SUBMIT
+naps, replies = [], []
+real_nap, saved_request = m.nap, m.Http.request
+m.nap = lambda sec: naps.append(float(sec))          # record the waits instead of waiting
+
+
+def ch_http(self, method, url, headers=None, json_body=None, idempotent=None, retries=None, timeout=None,
+            raw_body=None):
+    if "/check-tcp?" in url:
+        body = replies.pop(0) if replies else {"ok": 1, "request_id": "r1", "permanent_link": "l",
+                                               "nodes": {"ir1": []}}
+        return m.HttpResponse(200, {}, json.dumps(body).encode(), url)
+    if "/check-result/" in url:
+        return m.HttpResponse(200, {}, json.dumps({"ir1": [{"time": 0.1, "address": "x"}]}).encode(), url)
+    raise AssertionError(url)
+
+
+m.Http.request = ch_http
+cp = m.server_config(m.load_config({}, None), S1, 0, 1)
+assert cp["CHECKHOST_MIN_SPACING_SEC"] == 30 and cp["CHECK_SPACING_SEC"] == 60
+lg = m.EventLog(cp, quiet=True)
+ch_a, ch_b = m.CheckHost(cp, m.Http(cp, lg), lg), m.CheckHost(cp, m.Http(cp, lg), lg)     # two servers
+m.CheckHost.last_submit = 0.0
+ch_a.submit("tcp", "1.1.1.1:22", ["ir1"])
+assert naps == []                                     # the first request goes out at once
+ch_b.submit("tcp", "2.2.2.2:22", ["ir1"])             # another server, right after it
+assert len(naps) == 1 and 29 <= naps[0] <= 30, naps   # it waits its turn in the shared queue
+assert 0 < ch_a.last_own_submit <= ch_b.last_own_submit
+# check-host answers "limit exceeded": the queue backs off for 2 minutes, for every server
+naps.clear()
+replies[:] = [{"error": "limit_exceeded"}]
+m.CheckHost.last_submit = 0.0
+ch_a.run("tcp", "1.1.1.1:22", ["ir1"])
+assert any(119 <= x <= 120 for x in naps), naps
+m.Http.request = saved_request
+
+
+def paced_cycle(self, ip, purpose):                   # as a real check does: note when it was sent
+    self.ch.last_own_submit = m.time.time()
+    return dict(good)
+
+
+m.Reachability.cycle = paced_cycle
+m.CheckHost.last_submit = 0.0
+naps.clear()
+C = yaml("management_ip: %s\n" % S1)
+assert m.main(C + ["test", "--yes", "--rounds", "1"]) == 0
+assert any(59 <= x <= 60 for x in naps), naps         # the IP's second check: 60 s after its first
+m.nap = real_nap
+print("PACING OK")
