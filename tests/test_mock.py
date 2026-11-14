@@ -823,3 +823,20 @@ assert report.startswith(" 2 IP(s) tested"), report[:200]
 run_ips = {r["ip"] for r in m.load_results()[-2:]}
 assert all(ip in report for ip in run_ips) and not any(ip in report for ip in old_ips), report
 print("SLOW RELEASE OK")
+
+# ---- --ips N: N test IPs in total, shared by all servers ------------------------------------------
+m.Reachability.cycle = lambda self, ip, purpose: dict(good)
+C = yaml('management_ip: "%s, %s"\n' % (S1, S2))
+for extra, label in ((["--ips", "3"], "parallel"), (["--ips", "3", "--sequential"], "sequential")):
+    before = len(m.load_results())
+    buf = _io2.StringIO()
+    with _ctx2.redirect_stdout(buf):
+        rc = m.main(C + ["test", "--yes"] + extra)
+    new = m.load_results()[before:]
+    assert rc == 0 and len(new) == 3, (label, rc, len(new), buf.getvalue()[-800:])
+    assert {r["server"] for r in new} == {S1, S2}, (label, [r["server"] for r in new])   # both took part
+    assert "IP 3 of 3 in this run" in buf.getvalue() and "IP 4 of" not in buf.getvalue()
+    assert "this run: 3 IP(s) tested" in buf.getvalue()
+assert [p["id"] for p in c1.ports] == ["p-mgmt-srv1"] and [p["id"] for p in cloud["srv2"].ports] == ["p-mgmt-srv2"]
+assert m.main(C + ["test", "--yes", "--ips", "2", "--dry-run"]) == 0
+print("TOTAL IPS OK")

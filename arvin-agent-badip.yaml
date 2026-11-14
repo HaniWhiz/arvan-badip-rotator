@@ -68,7 +68,8 @@ ssh_extra_opts: []                # e.g. ["-o", "ProxyJump=bastion.example"]
 # OPTIONAL: test run
 # =============================================================================
 
-rounds: 5                         # how many test IPs per run (allocate -> test -> release)
+rounds: 5                         # test IPs per SERVER in one run (allocate -> test -> release)
+total_ips: 0                      # test IPs IN TOTAL, shared by all servers (0 = use rounds per server)
 checks_per_ip: 2                  # check-host cycles per test IP
 round_spacing_sec: 60             # pause between rounds
 baseline_check: false             # off: the management IP is known good and is not judged
