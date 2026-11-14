@@ -725,3 +725,68 @@ assert m.main(C + ["test", "--yes", "--rounds", "1"]) == 0
 assert any(59 <= x <= 60 for x in naps), naps         # the IP's second check: 60 s after its first
 m.nap = real_nap
 print("PACING OK")
+
+# ---- a server in another region: init searches the regions and remembers the one it is in ---------
+S3 = "185.3.3.10"
+srv3 = FakeServer("srv3", "185.3.3")
+other_region = "ir-tbz-dc1"
+base_call = m.ArvanAPI.call
+region_calls = []
+
+
+def region_call(self, method, url, body=None, idempotent=None, allow_404=False, empty_body=False):
+    if url.endswith("/ecc/v1/details"):
+        return [{"code": "ir-thr-ba1", "dc": "x"}, {"code": other_region, "dc": "y"}, {"code": "not a code"}]
+    region = url.split("/regions/")[1].split("/")[0]
+    region_calls.append(region)
+    if "/servers/nope" in url:                       # an ID that exists in no region
+        raise m.ApiError(method, url, 404, "Instance not found", None)
+    if region == other_region:
+        path = url.split("/regions/" + other_region)[1]
+        if method == "GET" and path == "/servers":
+            return [srv3.server()]
+        if method == "GET" and path == "/servers/srv3":
+            return srv3.server()
+        if method == "GET" and path == "/networks":
+            return [{"id": "n-srv3", "name": "public", "subnets": [{
+                "id": "sub3", "cidr": "185.3.3.0/24", "gateway_ip": "185.3.3.1",
+                "servers": [{"id": "srv3", "ips": [{"ip": S3, "mac_address": "aa:3", "port_id": "p-mgmt-srv3",
+                                                    "public": True, "float_ip": False}]}]}]}]
+        raise AssertionError((method, path))
+    if "/servers/srv3" in url:                       # srv3 does not exist in ir-thr-ba1
+        raise m.ApiError(method, url, 404, "Instance not found", None)
+    return base_call(self, method, url, body, idempotent, allow_404, empty_body)
+
+
+m.ArvanAPI.call = region_call
+assert m.ArvanAPI(m.load_config({}, None), None, "k").list_regions()[:2] == ["ir-thr-ba1", other_region]
+
+# by server ID: not in ir-thr-ba1 -> found in ir-tbz-dc1, and saved
+C = yaml('management_ip: "%s, %s"\nserver_id: "srv1, srv3"\nregion: ir-thr-ba1\n' % (S1, S3))
+assert m.main(C + ["init"]) == 0
+assert json.load(open(m.config_path(S3)))["REGION"] == other_region
+assert json.load(open(m.config_path(S1)))["REGION"] == "ir-thr-ba1"
+base3 = m.load_config({}, y)
+assert m.server_config(base3, S3, 1, 2)["REGION"] == other_region          # the saved region wins
+assert m.server_config(base3, S1, 0, 2)["REGION"] == "ir-thr-ba1"
+
+# by IP (no server_id): found by searching the regions too
+os.remove(m.config_path(S3))
+C = yaml('management_ip: "%s, %s"\n' % (S1, S3))
+assert m.main(C + ["init"]) == 0
+cfg3 = json.load(open(m.config_path(S3)))
+assert cfg3["REGION"] == other_region and cfg3["SERVER_ID"] == "srv3", cfg3
+
+# a region per IP (comma list) is used as given; a wrong count is refused
+C = yaml('management_ip: "%s, %s"\nregion: "ir-thr-ba1, %s"\n' % (S1, S3, other_region))
+b3 = m.load_config({}, y)
+assert m.server_config(b3, S1, 0, 2)["REGION"] == "ir-thr-ba1" and m.server_config(b3, S3, 1, 2)["REGION"] == other_region
+C = yaml('management_ip: "%s, %s"\nregion: "a-b-c, d-e-f, g-h-i"\n' % (S1, S3))
+assert m.main(C + ["status"]) == 1
+
+# a server ID that exists nowhere: a clear error after searching
+C = yaml('management_ip: "%s"\nserver_id: "nope"\n' % S3)
+os.remove(m.config_path(S3))
+assert m.main(C + ["init"]) == 1
+m.ArvanAPI.call = base_call
+print("REGIONS SEARCH OK")

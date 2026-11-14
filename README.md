@@ -77,7 +77,7 @@ All inputs are in one flat YAML file. [`arvin-agent-badip.yaml`](arvin-agent-bad
 | Required | Meaning |
 |---|---|
 | `management_ip` | the public IPv4 you SSH to; never released. Several servers: `"185.1.1.10, 185.2.2.20"` |
-| `region` | ArvanCloud region code, e.g. `ir-thr-ba1` |
+| `region` | ArvanCloud region code, e.g. `ir-thr-ba1` (in the panel URL after `/ecc/`). If a server is not in this region, `init` searches every region and remembers the one it is in. Several servers in different regions can also be given one region per IP: `"ir-thr-ba1, ir-tbz-dc1"` |
 | `ssh_user` | `hani` |
 | `ssh_key` | see below |
 

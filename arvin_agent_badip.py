@@ -76,7 +76,11 @@ DEFAULTS: Dict[str, Any] = {
     "API_KEY_PREFIX": "Apikey ",
     "API_KEY": "",                    # the key itself OR the path of a file holding it
     "API_KEY_FILE": "",               # old name of API_KEY (value or path accepted)
-    "REGION": "ir-thr-ba1",
+    "REGION": "ir-thr-ba1",           # one region, or one per management IP: "ir-thr-ba1, ir-tbz-dc1"
+    # Regions searched when a server is not in its configured region. The current list is
+    # asked from the API (GET /ecc/v1/details); this list is the fallback.
+    "KNOWN_REGIONS": ["ir-thr-ba1", "ir-thr-w1", "ir-thr-c1", "ir-thr-c2", "ir-thr-at1",
+                      "ir-tbz-dc1", "ir-tbz-sh1", "nl-ams-su1"],
     "SERVER_ID": "",                  # found by `init` from the management IP
     "SERVER_NAME": "",
     "IP_TYPE": "ipv4",
@@ -529,10 +533,22 @@ def server_config(base: Dict[str, Any], ip: str, index: int, count: int) -> Dict
             raise AgentError("unknown key(s) in %s: %s" % (p, ", ".join(unknown)))
         cfg.update(saved)
     saved_sid = cfg.get("SERVER_ID") or ""
+    saved_region = cfg.get("REGION") if os.path.isfile(p) else ""
     for k, v in base.items():
-        if k == "SERVER_ID" or v == DEFAULTS.get(k, object()):
+        if k in ("SERVER_ID", "REGION") or v == DEFAULTS.get(k, object()):
             continue
         cfg[k] = v
+    # region: one per IP (comma list, same order), or one for all. A region that `init` found
+    # and saved for this server wins over a single YAML region, since servers can be in
+    # different regions.
+    regs = [x.strip() for x in str(base.get("REGION") or "").split(",") if x.strip()]
+    if len(regs) > 1:
+        if len(regs) != count:
+            raise AgentError("region lists %d region(s) for %d management IP(s); give one per IP, "
+                             "in the same order, or one for all" % (len(regs), count))
+        cfg["REGION"] = regs[index]
+    else:
+        cfg["REGION"] = saved_region or (regs[0] if regs else DEFAULTS["REGION"])
     cfg["MANAGEMENT_IP"] = ip
     cfg["_YAML_PATH"] = base.get("_YAML_PATH", "")
     # server_id may be one UUID (single server) or a comma list in the same order as the IPs
@@ -926,6 +942,22 @@ class ArvanAPI:
 
     def list_servers(self) -> List[Dict[str, Any]]:
         return self.call("GET", self._r("/servers")) or []
+
+    def list_regions(self) -> List[str]:
+        """Region codes: from GET /ecc/v1/details (as the Terraform provider does), else KNOWN_REGIONS."""
+        found: List[str] = []
+        with contextlib.suppress(AgentError):
+            for d in self.call("GET", self.base + "/details") or []:
+                if not isinstance(d, dict):
+                    continue
+                for k in ("code", "region"):
+                    v = str(d.get(k) or "")
+                    if re.fullmatch(r"[a-z]{2}-[a-z]{2,4}-[a-z0-9]+", v) and v not in found:
+                        found.append(v)
+        for v in self.cfg.get("KNOWN_REGIONS") or []:
+            if v not in found:
+                found.append(v)
+        return found
 
     def get_server(self) -> Dict[str, Any]:
         return self.call("GET", self._r("/servers/%s" % self.server_id)) or {}
@@ -1819,15 +1851,54 @@ class Agent:
                        WD=c["MGMT_WATCHDOG_SEC"])
 
     # ------------------------------------------------------------------- init --
-    def _find_server(self, mgmt_ip: str) -> None:
+    def _find_in_region(self, mgmt_ip: str) -> Optional[Dict[str, Any]]:
+        """The server in cfg["REGION"]: by SERVER_ID if set, else by its management IP."""
         cfg = self.cfg
-        if not cfg.get("SERVER_ID"):
+        if cfg.get("SERVER_ID"):
+            self.api.server_id = cfg["SERVER_ID"]
+            try:
+                return self.api.get_server() or None
+            except ApiError as exc:
+                if exc.kind in ("not_found", "forbidden", "client_error"):
+                    return None
+                raise
+        try:
             matches = [s for s in self.api.list_servers() if mgmt_ip in ArvanAPI.server_ipv4s(s)]
-            if len(matches) != 1:
-                raise AgentError("found %d servers in region %s with IP %s; pass --server-id"
-                                 % (len(matches), cfg["REGION"], mgmt_ip))
-            cfg["SERVER_ID"] = matches[0].get("id")
-            cfg["SERVER_NAME"] = matches[0].get("name") or ""
+        except ApiError as exc:
+            if exc.kind in ("not_found", "forbidden", "client_error"):
+                return None
+            raise
+        if len(matches) > 1:
+            raise AgentError("found %d servers in region %s with IP %s; set server_id"
+                             % (len(matches), cfg["REGION"], mgmt_ip))
+        return matches[0] if matches else None
+
+    def _find_server(self, mgmt_ip: str) -> None:
+        """Find the server; if it is not in its configured region, search every region and
+        remember the one it is in (init saves it)."""
+        cfg = self.cfg
+        first = cfg["REGION"]
+        srv = self._find_in_region(mgmt_ip)
+        if not srv:
+            how = "server %s" % cfg["SERVER_ID"] if cfg.get("SERVER_ID") else "IP %s" % mgmt_ip
+            print("not in region %s; searching the other regions for %s ..." % (first, how))
+            for region in self.api.list_regions():
+                if region == first:
+                    continue
+                cfg["REGION"] = region
+                srv = self._find_in_region(mgmt_ip)
+                if srv:
+                    print("found in region %s" % region)
+                    break
+        if not srv:
+            cfg["REGION"] = first
+            if cfg.get("SERVER_ID"):
+                raise AgentError("server %s was not found in any region. Check the ID in the panel, or set "
+                                 "server_id to \"\" so the server is found by its IP" % cfg["SERVER_ID"])
+            raise AgentError("no server with IP %s was found in any region (searched %s)"
+                             % (mgmt_ip, ", ".join(self.api.list_regions())))
+        cfg["SERVER_ID"] = srv.get("id") or cfg.get("SERVER_ID")
+        cfg["SERVER_NAME"] = srv.get("name") or cfg.get("SERVER_NAME") or ""
         self.api.server_id = cfg["SERVER_ID"]
 
     def inspect(self) -> int:

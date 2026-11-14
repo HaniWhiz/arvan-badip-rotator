@@ -19,7 +19,9 @@
 # Several servers: separate them with commas. They are tested at the same time.
 management_ip: ""                 # e.g. "185.1.1.10" or "185.1.1.10, 185.2.2.20"
 
-# ArvanCloud region code of the server (shown in the panel / API).
+# ArvanCloud region code of the server (in the panel URL: panel.arvancloud.ir/ecc/<region>/servers/...).
+# Servers in different regions: `init` searches every region for a server it cannot find here
+# and remembers its region. Or give one region per management IP: "ir-thr-ba1, ir-tbz-dc1".
 region: ir-thr-ba1
 
 # How a new IP gets configured on the server:
