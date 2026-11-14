@@ -156,6 +156,8 @@ Regions are set by `probe_regions` in the YAML file (check-host node country cod
 ./arvin_agent_badip.py cleanup --yes          # release a test IP left behind by a crash
 ```
 
+**How many IPs:** `--rounds N` (or `rounds:`) tests N IPs on **each** server, so 3 servers × `--rounds 2` = 6 IPs. `--ips N` (or `total_ips:`) tests N IPs **in total**: in a parallel run, whichever server is free takes the next IP until N are done.
+
 Useful flags for `test`: `--checks-per-ip N`, `--check-type tcp|ping|http`, `--check-port P` (only if a service listens on all addresses on that port), and `--sequential`.
 
 The default check is a TCP connection to port 22. `--check-type ping` (or `check_type: ping`) uses ICMP ping instead; the firewall must then allow ping.

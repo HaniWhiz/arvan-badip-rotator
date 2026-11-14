@@ -137,7 +137,10 @@ DEFAULTS: Dict[str, Any] = {
     "SUDO": "sudo -n",                # "" if SSH_USER is root
 
     # ---- Test run -----------------------------------------------------------
-    "ROUNDS": 5,                      # how many test IPs per run
+    "ROUNDS": 5,                      # how many test IPs per SERVER in one run
+    # How many test IPs IN TOTAL in one run, shared by all servers (0 = use ROUNDS per server).
+    # E.g. 5 with 3 servers: the servers take turns until 5 IPs were tested.
+    "TOTAL_IPS": 0,
     "CHECKS_PER_IP": 2,               # check-host cycles per test IP
     "ROUND_SPACING_SEC": 60,          # pause between rounds
     "BASELINE_CHECK": False,          # off: the management IP is known good, never judged
@@ -220,6 +223,24 @@ STOP = threading.Event()          # parallel run: set by the main thread on Ctrl
 _TL = threading.local()           # per worker thread: .stopping, .shield
 PARALLEL_ACTIVE = False           # True while worker threads are running
 RULES: Dict[str, Any] = {"OUTSIDE_MIN_OK": 1, "MIN_CONCLUSIVE_NODES": 3}   # used when results are shown
+
+
+class IpBudget:
+    """The number of test IPs left in this run, shared by all servers (TOTAL_IPS)."""
+
+    def __init__(self, total: int) -> None:
+        self.total, self.left, self._lock = int(total), int(total), threading.Lock()
+
+    def take(self) -> Optional[int]:
+        """Claim one IP; returns its number (1..total), or None when the run has enough."""
+        with self._lock:
+            if self.left <= 0:
+                return None
+            self.left -= 1
+            return self.total - self.left
+
+
+IP_BUDGET: Optional[IpBudget] = None   # set by main() when TOTAL_IPS > 0
 
 
 class StopRequested(BaseException):
@@ -2482,9 +2503,16 @@ class Agent:
         try:
             self.protect_mgmt()
             for n in range(1, rounds + 1):
+                slot = IP_BUDGET.take() if IP_BUDGET is not None else None
+                if IP_BUDGET is not None and slot is None:
+                    break                          # the run has tested its total number of IPs
                 if n > 1:
                     nap(float(self.cfg["ROUND_SPACING_SEC"]))
-                self.log.say("\n===== round %d/%d =====" % (n, rounds))
+                if slot is not None:
+                    self.log.say("\n===== IP %d of %d in this run (round %d on this server) ====="
+                                 % (slot, IP_BUDGET.total, n))
+                else:
+                    self.log.say("\n===== round %d/%d =====" % (n, rounds))
                 self.guard_beat()
                 rec = self.one_round(run_id, n, seen)
                 seen.add(rec["ip"])
@@ -2821,7 +2849,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--server-id", help="only with a single management IP")
     sub.add_parser("preflight", help="read-only checks: API key, server, SSH, sudo, check-host")
     p = sub.add_parser("test", help="allocate, test and release test IPs (billable)")
-    p.add_argument("--rounds", type=int)
+    p.add_argument("--rounds", type=int, help="test IPs per server")
+    p.add_argument("--ips", type=int, help="test IPs in total, shared by all servers (overrides --rounds)")
     p.add_argument("--checks-per-ip", type=int)
     p.add_argument("--check-type", choices=["tcp", "ping", "http"])
     p.add_argument("--check-port", type=int)
@@ -2842,7 +2871,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     a = ap.parse_args(argv)
     a.server_id_check = bool(getattr(a, "server_id", None))
     for name in ("server_id", "management_ip", "rounds", "checks_per_ip", "check_type", "check_port",
-                 "no_baseline", "dry_run", "sequential", "yes", "bad", "good", "last"):
+                 "no_baseline", "dry_run", "sequential", "yes", "bad", "good", "last", "ips"):
         if not hasattr(a, name):
             setattr(a, name, None)
     if not a.cmd:
@@ -2854,7 +2883,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ov: Dict[str, Any] = {"REGION": a.region, "SSH_USER": a.ssh_user, "SSH_KEY": a.ssh_key,
                           "SSH_PORT": a.ssh_port, "LOG_LEVEL": "debug" if a.verbose else None}
     if a.cmd == "test":
-        ov.update(ROUNDS=a.rounds, CHECKS_PER_IP=a.checks_per_ip, CHECK_TYPE=a.check_type,
+        ov.update(ROUNDS=a.rounds, TOTAL_IPS=a.ips, CHECKS_PER_IP=a.checks_per_ip, CHECK_TYPE=a.check_type,
                   CHECK_PORT=a.check_port, BASELINE_CHECK=False if a.no_baseline else None,
                   PARALLEL=False if a.sequential else None)
     if a.cmd == "init":
@@ -2923,18 +2952,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         if real_test and len(cfgs) > 1 and bool(base["PARALLEL"]) and not parallel:
             print("note: vm_config_mode is ssh, so the servers are tested one after another")
         if real_test and not a.yes:
-            rounds = sum(int(c["ROUNDS"]) for c in cfgs)
+            rounds = (int(base["TOTAL_IPS"]) if int(base["TOTAL_IPS"] or 0) > 0
+                      else sum(int(c["ROUNDS"]) for c in cfgs))
             ans = input("This allocates and releases %d billable public IPv4(s) on %d server(s) (%s)%s. "
                         "Continue? [y/N] " % (rounds, len(cfgs), ", ".join(sel),
                                               ", all servers at the same time" if parallel else ""))
             if ans.strip().lower() not in ("y", "yes"):
                 return 1
+        global IP_BUDGET
+        IP_BUDGET = None
+        if real_test and int(base["TOTAL_IPS"] or 0) > 0:
+            IP_BUDGET = IpBudget(int(base["TOTAL_IPS"]))
+            total = int(base["TOTAL_IPS"])
+            for c in cfgs:
+                # in parallel, whichever server is free takes the next IP; one after another,
+                # each server does its share (rounded up; the shared count stops at the total)
+                c["ROUNDS"] = total if parallel else -(-total // len(cfgs))
         if parallel:
             return run_parallel(cfgs)
         if (a.cmd == "test" and a.dry_run and len(cfgs) > 1 and bool(base["PARALLEL"])
                 and all(c["VM_CONFIG_MODE"] == "panel" for c in cfgs)):
             print("note: a real run tests these %d servers at the same time" % len(cfgs))
         rc = 0
+        combined = real_test and len(cfgs) > 1          # one report for all servers at the end
+        run_rows: List[Dict[str, Any]] = []
         for c in cfgs:
             if len(cfgs) > 1:
                 print("\n################ server %s ################" % c["MANAGEMENT_IP"])
@@ -2951,7 +2992,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 elif a.dry_run:
                     r = agent.dry_run_report(int(c["ROUNDS"]))
                 else:
-                    r = agent.test(int(c["ROUNDS"]))
+                    try:
+                        r = agent.test(int(c["ROUNDS"]), summary=not combined)
+                    finally:
+                        run_rows += getattr(agent, "last_rows", [])
                     if r == 4 or State(c["MANAGEMENT_IP"]).pending:
                         rc = max(rc, r or 2)
                         print("stopping: not continuing with the other servers")
@@ -2960,6 +3004,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print("error [%s]: %s" % (c["MANAGEMENT_IP"], exc), file=sys.stderr)
                 r = 1
             rc = max(rc, r)
+        if combined:
+            print("\n" + run_report(run_rows))
+            save_state_file()
+            pending = [c["MANAGEMENT_IP"] for c in cfgs if State(c["MANAGEMENT_IP"]).pending]
+            if pending:
+                print("\n!! an allocation is still pending on %s: run `%s cleanup --yes`"
+                      % (", ".join(pending), PROJECT))
+            print("results: %s  (table: `%s state`, file: %s)"
+                  % (os.path.join(HOME_DIR, "results.csv"), PROJECT, os.path.join(HOME_DIR, "state.txt")))
         return rc
     except AgentError as exc:
         print("error: %s" % exc, file=sys.stderr)
