@@ -790,3 +790,36 @@ os.remove(m.config_path(S3))
 assert m.main(C + ["init"]) == 1
 m.ArvanAPI.call = base_call
 print("REGIONS SEARCH OK")
+
+# ---- a slow release: ArvanCloud ignores the first request; the script asks again and waits ---------
+import contextlib as _ctx2
+import io as _io2
+ignored, base_call2 = set(), m.ArvanAPI.call
+
+
+def slow_detach(self, method, url, body=None, idempotent=None, allow_404=False, empty_body=False):
+    if method == "PATCH" and url.endswith("/detach"):
+        pid = url.split("/networks/")[1].split("/")[0]
+        if pid not in ignored:                    # the first request for each port is not carried out
+            ignored.add(pid)
+            return {}
+    return base_call2(self, method, url, body, idempotent, allow_404, empty_body)
+
+
+m.ArvanAPI.call = slow_detach
+m.Reachability.cycle = lambda self, ip, purpose: dict(good)
+C = yaml("management_ip: %s\nrelease_timeout_sec: 5\nrelease_retry_sec: 0.3\n" % S1)
+old_ips = {r["ip"] for r in m.load_results() if r.get("ip")}
+buf = _io2.StringIO()
+with _ctx2.redirect_stdout(buf):
+    rc = m.main(C + ["test", "--yes", "--rounds", "2"])
+out2 = buf.getvalue()
+m.ArvanAPI.call = base_call2
+assert rc == 0, out2[-1500:]
+assert out2.count("release_request_again") == 2 and [p["id"] for p in c1.ports] == ["p-mgmt-srv1"], out2[-1500:]
+# the report at the end shows only the IPs of this run
+report = out2.split("===== this run:")[1]
+assert report.startswith(" 2 IP(s) tested"), report[:200]
+run_ips = {r["ip"] for r in m.load_results()[-2:]}
+assert all(ip in report for ip in run_ips) and not any(ip in report for ip in old_ips), report
+print("SLOW RELEASE OK")
