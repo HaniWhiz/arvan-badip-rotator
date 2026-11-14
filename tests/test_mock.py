@@ -476,6 +476,13 @@ assert reach.cycle(S1, "test")["verdict"] == "BLOCKED"
 # nobody reaches it -> down
 failing.update({"de1.node", "us1.node", "sg1.node"})
 assert reach.cycle(S1, "test")["verdict"] == "DOWN"
+# readiness probe: Iran only asks the Iranian nodes, "outside" only nodes outside Iran
+seen_nodes.clear()
+failing.clear(); failing.update({"ir1.node", "ir2.node", "ir3.node"})
+assert reach.ready_probe(S1, "iran")["ok"] == 0 and set(seen_nodes) == {"ir1.node", "ir2.node", "ir3.node"}
+seen_nodes.clear()
+r = reach.ready_probe(S1, "outside")
+assert r["ok"] >= 1 and seen_nodes and not any(n.startswith("ir") for n in seen_nodes), (r, seen_nodes)
 print("REGIONS OK")
 
 # ---- DOWN verdict: diagnostics are collected before the release ---------------------------------
@@ -518,6 +525,56 @@ last = m.load_results()[-1]
 assert last["verdict"] == "DOWN" and len(last["cycles"]) == 2 and last["released"] is True, last
 assert len(scripts) == n_ssh
 print("PANEL OK")
+
+# ---- panel mode: wait until the new IP answers (Iran first, then outside Iran) before testing ------
+up = {"after": 0, "probes": []}                  # the IP answers once `after` probes were sent
+
+
+def late_probe(self, ip, side):
+    up["probes"].append(side)
+    ok = len(up["probes"]) > up["after"] and (side == "iran" or up.get("outside_only"))
+    return {"side": side, "ok": 3 if ok else 0, "fail": 0 if ok else 3, "link": "l"}
+
+
+def late_cycle(self, ip, purpose):            # DOWN everywhere until the IP is up
+    if len(up["probes"]) <= up["after"]:
+        return {"verdict": "DOWN", "why": "mock", "ok": 0, "fail": 5, "unknown": 0, "control_ok": 0,
+                "ok_ratio": 0.0, "link": "l", "by_region": {"iran": {"ok": 0, "fail": 5, "unknown": 0}}}
+    return dict(good)
+
+
+m.Reachability.ready_probe, m.Reachability.cycle = late_probe, late_cycle
+# 1) it answers from Iran at once: one probe, then the test
+assert m.main(C + ["test", "--yes", "--rounds", "1"]) == 0
+last = m.load_results()[-1]
+assert up["probes"] == ["iran"] and last["ready"] is True and last["ready_from"] == "iran", (up, last)
+assert last["verdict"] == "GOOD", last
+# 2) the panel is slow: nobody answers for 2 tries; it keeps asking Iran first, then outside Iran
+up.update(after=4, probes=[])
+assert m.main(C + ["test", "--yes", "--rounds", "1"]) == 0
+last = m.load_results()[-1]
+assert up["probes"] == ["iran", "outside", "iran", "outside", "iran"], up["probes"]
+assert last["ready"] is True and last["verdict"] == "GOOD", last          # before: DOWN
+# 3) only nodes outside Iran reach it (blocked in Iran): the test starts without waiting any longer
+up.update(after=0, probes=[], outside_only=True)
+m.Reachability.ready_probe = lambda self, ip, side: (up["probes"].append(side), {
+    "side": side, "ok": 3 if side == "outside" else 0, "fail": 0 if side == "outside" else 3, "link": "l"})[1]
+assert m.main(C + ["test", "--yes", "--rounds", "1"]) == 0
+last = m.load_results()[-1]
+assert up["probes"] == ["iran", "outside"] and last["ready_from"] == "outside", (up, last)
+# 4) it never answers: the wait is bounded, then the IP is tested and released anyway
+up.update(after=10 ** 6, probes=[], outside_only=False)
+m.Reachability.ready_probe = late_probe
+assert m.main(C + ["test", "--yes", "--rounds", "1"]) == 0
+last = m.load_results()[-1]
+assert last["ready"] is False and last["verdict"] == "DOWN" and last["released"] is True, last
+assert len(up["probes"]) == 2 * (600 // 60 + 1), len(up["probes"])
+# 5) ready_wait_sec: 0 turns the wait off
+up.update(probes=[])
+assert m.main(yaml("management_ip: %s\nready_wait_sec: 0\n" % S1) + ["test", "--yes", "--rounds", "1"]) == 0
+assert up["probes"] == []
+m.Reachability.ready_probe = lambda self, ip, side: {"side": side, "ok": 3, "fail": 0, "link": "l"}
+print("READY OK")
 
 # ---- results.csv is rebuilt from results.jsonl: same columns in every row, current rules -------------
 import csv as _csv

@@ -19,8 +19,9 @@ The management IP is never released, and neither is its port or any port that ex
 
 1. Add the IP through the API.
 2. Wait `new_ip_settle_sec` (45 s) for the panel to configure it.
-3. Test it from Iran and the other regions.
-4. Remove it through the API and wait for the management IP to answer again.
+3. Wait until the IP answers (`ready_wait_sec`, up to 600 s). Each try asks the Iranian nodes first; if none reaches the IP, it asks a few nodes outside Iran. As soon as either side reaches it, the test starts. The panel sometimes needs several minutes, and an IP tested before it is up looks `DOWN` everywhere. An IP that never answers is tested anyway and comes out `DOWN`.
+4. Test it from Iran and the other regions.
+5. Remove it through the API and wait for the management IP to answer again.
 
 Only the API key is needed. `ssh_user` and `ssh_key` are ignored.
 
@@ -122,7 +123,7 @@ Every check runs from Iran and from several other regions at once (Europe, USA, 
 | `GOOD` | reachable from Iran **and** from outside Iran |
 | `BAD`, Iran only | Iran reaches it, but not a single node outside Iran does |
 | `BAD`, blocked in Iran | nodes outside Iran reach it, but Iran does not |
-| `DOWN` | no region reaches it: a fault on the server or in the network, not a block |
+| `DOWN` | no region reaches it, even after waiting `ready_wait_sec` for it to come up: a fault on the server or in the network, not a block |
 | `MIXED` | the checks of that IP disagree |
 | `INCONCLUSIVE` | too few nodes answered |
 

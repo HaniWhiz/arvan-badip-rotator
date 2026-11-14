@@ -109,6 +109,10 @@ iran_control_target: "1.1.1.1:443"
 protect_mgmt_route: true          # pin the management IP's replies to its own NIC
 mgmt_watchdog_sec: 90             # VM auto-reverts the pin if a fresh SSH can't confirm it
 max_public_ips_per_server: 4      # ArvanCloud per-server cap
+# panel mode: after adding an IP, wait until it answers before testing it. Each try asks the
+# Iranian nodes first, then (if none reached it) a few nodes outside Iran. The test starts as soon
+# as either side reaches it. An IP that never answers is tested anyway after this long. 0 = no wait.
+ready_wait_sec: 600
 # check-host.net pacing (its limits are not documented, so both values are cautious):
 check_spacing_sec: 60             # between two checks of the SAME IP
 checkhost_min_spacing_sec: 30     # between any two requests, from ALL servers together

@@ -109,6 +109,10 @@ DEFAULTS: Dict[str, Any] = {
     "VM_CONFIG_MODE": "panel",
     "NEW_IP_SETTLE_SEC": 45,          # panel mode: wait for the panel to configure the new IP
     "DOWN_RETRY_WAIT_SEC": 60,        # panel mode: wait before re-checking an IP that looked DOWN
+    # panel mode: before the real test, wait until the new IP answers. Each try asks the
+    # Iranian nodes first; if none reaches it, it asks a few nodes outside Iran. The test starts
+    # as soon as either side reaches the IP, or after READY_WAIT_SEC (0 = do not wait).
+    "READY_WAIT_SEC": 600,
     "MGMT_RETURN_WAIT_SEC": 90,       # panel mode: wait for management to answer after a release
     # ssh mode: a guard loop runs ON THE VM during a test. Every second it restores the
     # management rule/route and the test IP's rule/route, and removes a default route
@@ -663,7 +667,7 @@ class State:
 RESULT_FIELDS = ["finished_at", "server", "run_id", "round", "ip", "port_id", "verdict", "reason",
                  "checks", "reachable_cycles", "iran_only_cycles", "blocked_cycles", "down_cycles",
                  "inconclusive_cycles", "best_ok_ratio", "egress_ok", "from_mac_tcp", "seen_before",
-                 "released", "error", "regions_text", "links"]
+                 "released", "error", "regions_text", "links", "ready", "ready_from", "ready_after_sec"]
 
 
 def append_result(rec: Dict[str, Any]) -> None:
@@ -1270,6 +1274,21 @@ class Reachability:
         if t == "http":
             return "%s://%s:%d%s" % ("https" if port == 443 else "http", ip, port, self.cfg["CHECK_HTTP_PATH"])
         return ip
+
+    def ready_probe(self, ip: str, side: str) -> Dict[str, Any]:
+        """Is the new IP up yet? side "iran" asks the Iranian nodes, "outside" a few nodes
+        outside Iran. -> {"side", "ok", "fail", "link"}. Not a verdict: only "does anyone answer"."""
+        ctype = self.cfg["CHECK_TYPE"]
+        if side == "iran":
+            nodes = self.ch.probe_nodes()
+        else:
+            nodes = [n for n in self.ch.control_nodes() if n not in set(self.ch.probe_nodes())]
+        raw, accepted, link = self.ch.run(ctype, self.target(ip), nodes)
+        kinds = [classify_node_result(ctype, raw.get(n))[0] for n in accepted]
+        res = {"side": side, "ok": kinds.count("ok"), "fail": kinds.count("fail"), "link": link}
+        self.log.event("info" if res["ok"] else "warning", "ready_probe", ip=ip, side=side,
+                       reached="%d/%d" % (res["ok"], res["ok"] + res["fail"]), link=link)
+        return res
 
     def cycle(self, ip: str, purpose: str) -> Dict[str, Any]:
         ctype = self.cfg["CHECK_TYPE"]
@@ -2331,6 +2350,7 @@ class Agent:
             self.log.info("waiting_for_panel", ip=ip, seconds=int(settle),
                           note="the panel configures the IP on the VM; management is unusable meanwhile")
             nap(settle)
+            self._wait_ready(ip, rec)
         else:
             self._ssh_configure(pend, rec, port)
         # ---- informational: TCP from this Mac ----------------------------------------
@@ -2343,7 +2363,7 @@ class Agent:
         # ---- 3) test from Iran ---------------------------------------------------------
         for i in range(int(cfg["CHECKS_PER_IP"])):
             self.guard_beat()
-            if i:
+            if i or rec.get("ready_probes"):
                 self.log.say("  waiting for the next check of %s (checks of one IP are %ss apart) ..."
                              % (ip, cfg["CHECK_SPACING_SEC"]))
                 nap(self.ch.last_own_submit + float(cfg["CHECK_SPACING_SEC"]) - time.time())
@@ -2373,6 +2393,44 @@ class Agent:
                 break
         if self.panel and rec["cycles"] and all(c["verdict"] == DOWN for c in rec["cycles"]):
             self._diagnose_down(pend, rec)
+
+    def _wait_ready(self, ip: str, rec: Dict[str, Any]) -> bool:
+        """Panel mode: the panel needs a variable time to configure a new IP, and an IP tested
+        before it is up looks DOWN everywhere. Ask Iran first; if no Iranian node reaches it, ask
+        a few nodes outside Iran. Return as soon as either side reaches it (the real test then
+        tells GOOD from BAD), or after READY_WAIT_SEC."""
+        cfg = self.cfg
+        wait = float(cfg["READY_WAIT_SEC"])
+        if wait <= 0:
+            return True
+        spacing = float(cfg["CHECK_SPACING_SEC"])
+        start, tries = time.time(), max(1, int(wait // max(spacing, 1.0)) + 1)
+        self.log.say("  waiting until %s answers (from Iran first, then from outside Iran; up to %ds) ..."
+                     % (ip, int(wait)))
+        for n in range(tries):
+            for side in ("iran", "outside"):
+                if rec.get("ready_probes"):          # two requests about one IP stay CHECK_SPACING_SEC apart
+                    nap(self.ch.last_own_submit + spacing - time.time())
+                self.guard_beat()
+                rec["ready_probes"] = rec.get("ready_probes", 0) + 1
+                try:
+                    r = self.reach.ready_probe(ip, side)
+                except InconclusiveError as exc:
+                    self.log.warning("ready_probe_failed", ip=ip, side=side, error=str(exc))
+                    continue
+                if r["ok"]:
+                    rec.update(ready=True, ready_from=side, ready_after_sec=int(time.time() - start))
+                    self.log.say("  %s answers %s (%d/%d nodes) after %ds; testing it now"
+                                 % (ip, "from Iran" if side == "iran" else "from outside Iran only",
+                                    r["ok"], r["ok"] + r["fail"], rec["ready_after_sec"]))
+                    return True
+            if time.time() - start >= wait or n + 1 >= tries:
+                break
+            self.log.say("  %s does not answer from Iran or from outside Iran yet; trying again ..." % ip)
+        rec.update(ready=False, ready_after_sec=int(time.time() - start))
+        self.log.warning("not_ready", ip=ip, waited_sec=rec["ready_after_sec"])
+        self.log.say("  %s did not answer from anywhere within %ds; testing it anyway" % (ip, int(wait)))
+        return False
 
     def _mgmt_back(self) -> bool:
         """Panel mode: after a release the panel restores the management route. Wait for
@@ -2574,6 +2632,9 @@ class Agent:
         if self.panel:
             print("  2. wait for the new port in GET /networks, then %ss for the panel to configure it "
                   "on the VM (no ssh; management is unusable until step 4)" % self.cfg["NEW_IP_SETTLE_SEC"])
+            if float(self.cfg["READY_WAIT_SEC"]) > 0:
+                print("     then wait up to %ss until <NEW_IP> answers: check-host from Iran first, "
+                      "then from outside Iran" % self.cfg["READY_WAIT_SEC"])
         else:
             print("  2. wait for the new port in GET /networks + its NIC (MAC) in the VM, then as root:")
             print("     " + TESTIP_UP_SH.strip().replace("\n", "\n     "))
