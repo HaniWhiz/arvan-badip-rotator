@@ -79,6 +79,9 @@ DEFAULTS: Dict[str, Any] = {
     "REGION": "ir-thr-ba1",           # one region, or one per management IP: "ir-thr-ba1, ir-tbz-dc1"
     # Regions searched when a server is not in its configured region. The current list is
     # asked from the API (GET /ecc/v1/details); this list is the fallback.
+    # One line per server: "<datacenter name or region code>, <management IP>, <server ID>".
+    # Overrides management_ip / region / server_id. The server ID is optional (init finds it).
+    "SERVERS": [],
     "KNOWN_REGIONS": ["ir-thr-ba1", "ir-thr-w1", "ir-thr-c1", "ir-thr-c2", "ir-thr-at1",
                       "ir-tbz-dc1", "ir-tbz-sh1", "nl-ams-su1"],
     "SERVER_ID": "",                  # found by `init` from the management IP
@@ -508,6 +511,8 @@ def load_yaml_inputs(path: str) -> Dict[str, Any]:
             continue
         if v is None or (v == "" and K != "SUDO"):
             continue                              # empty -> keep the default / init value
+        if K == "SERVERS" and isinstance(v, str):
+            v = [v]
         if isinstance(v, list) and K in ("MANAGEMENT_IP", "SERVER_ID"):
             v = ",".join(str(x) for x in v)       # [ip1, ip2] works as well as "ip1, ip2"
         d = DEFAULTS[K]
@@ -547,7 +552,48 @@ def load_config(overrides: Optional[Dict[str, Any]] = None,
     return cfg
 
 
-def server_config(base: Dict[str, Any], ip: str, index: int, count: int) -> Dict[str, Any]:
+# ArvanCloud datacenter names -> region codes. Names not listed here are searched for by
+# init (in the API's region list), and the region it finds is saved for that server.
+REGION_ALIASES = {"bamdad": "ir-thr-ba1", "forogh": "ir-thr-c2", "forough": "ir-thr-c2",
+                  "simin": "ir-thr-c1", "shahriar": "ir-tbz-dc1", "herman": "nl-ams-su1"}
+REGION_CODE_RE = r"[a-z]{2}-[a-z]{2,4}-[a-z0-9]+"
+UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+
+
+def parse_servers(items: Any) -> List[Dict[str, str]]:
+    """`servers:` lines -> [{ip, region, name, server_id}]. The parts of a line can come in any
+    order, separated by commas or spaces: an IPv4 address, a server UUID, and a datacenter
+    name (bamdad, simin, ...) or region code (ir-thr-c1)."""
+    out: List[Dict[str, str]] = []
+    for raw in (items if isinstance(items, list) else [items]):
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        e = {"ip": "", "region": "", "name": "", "server_id": ""}
+        for tok in re.split(r"[,\s]+", line):
+            if not tok:
+                continue
+            if _is_ipv4(tok):
+                e["ip"] = tok
+            elif re.fullmatch(UUID_RE, tok):
+                e["server_id"] = tok.lower()
+            elif re.fullmatch(REGION_CODE_RE, tok.lower()):
+                e["region"] = tok.lower()
+            elif re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", tok):
+                e["name"] = tok.lower()
+            else:
+                raise AgentError("servers: cannot read %r in line %r (expected a datacenter name, "
+                                 "an IPv4 address and optionally a server ID)" % (tok, line))
+        if not e["ip"]:
+            raise AgentError("servers: line %r has no management IP" % line)
+        if any(x["ip"] == e["ip"] for x in out):
+            raise AgentError("servers: %s is listed twice" % e["ip"])
+        out.append(e)
+    return out
+
+
+def server_config(base: Dict[str, Any], ip: str, index: int, count: int,
+                  entry: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Per-server config: DEFAULTS < saved by `init` < YAML < CLI, with MANAGEMENT_IP = ip."""
     cfg = copy.deepcopy(DEFAULTS)
     p = config_path(ip)
@@ -577,6 +623,16 @@ def server_config(base: Dict[str, Any], ip: str, index: int, count: int) -> Dict
         cfg["REGION"] = saved_region or (regs[0] if regs else DEFAULTS["REGION"])
     cfg["MANAGEMENT_IP"] = ip
     cfg["_YAML_PATH"] = base.get("_YAML_PATH", "")
+    if entry is not None:
+        # from a `servers:` line: an explicit region code wins, then the region init saved,
+        # then the datacenter name's known region; an unknown name is searched for by init.
+        name = entry.get("name") or ""
+        cfg["SERVER_NAME"] = cfg.get("SERVER_NAME") or ""
+        cfg["_DC_NAME"] = name
+        cfg["REGION"] = (entry.get("region") or saved_region or REGION_ALIASES.get(name)
+                         or DEFAULTS["REGION"])
+        cfg["SERVER_ID"] = entry.get("server_id") or saved_sid
+        return cfg
     # server_id may be one UUID (single server) or a comma list in the same order as the IPs
     sids = [x.strip() for x in str(base.get("SERVER_ID") or "").split(",") if x.strip()]
     if sids:
@@ -969,17 +1025,23 @@ class ArvanAPI:
     def list_servers(self) -> List[Dict[str, Any]]:
         return self.call("GET", self._r("/servers")) or []
 
-    def list_regions(self) -> List[str]:
-        """Region codes: from GET /ecc/v1/details (as the Terraform provider does), else KNOWN_REGIONS."""
+    def list_regions(self, hint: str = "") -> List[str]:
+        """Region codes: from GET /ecc/v1/details (as the Terraform provider does), else
+        KNOWN_REGIONS. Regions whose entry mentions `hint` (a datacenter name) come first."""
         found: List[str] = []
         with contextlib.suppress(AgentError):
+            matched: List[str] = []
             for d in self.call("GET", self.base + "/details") or []:
                 if not isinstance(d, dict):
                     continue
+                text = " ".join(str(v) for v in d.values()).lower()
                 for k in ("code", "region"):
                     v = str(d.get(k) or "")
-                    if re.fullmatch(r"[a-z]{2}-[a-z]{2,4}-[a-z0-9]+", v) and v not in found:
+                    if re.fullmatch(REGION_CODE_RE, v) and v not in found:
                         found.append(v)
+                        if hint and hint.lower() in text:
+                            matched.append(v)
+            found = matched + [v for v in found if v not in matched]
         for v in self.cfg.get("KNOWN_REGIONS") or []:
             if v not in found:
                 found.append(v)
@@ -1923,7 +1985,7 @@ class Agent:
         if not srv:
             how = "server %s" % cfg["SERVER_ID"] if cfg.get("SERVER_ID") else "IP %s" % mgmt_ip
             print("not in region %s; searching the other regions for %s ..." % (first, how))
-            for region in self.api.list_regions():
+            for region in self.api.list_regions(cfg.get("_DC_NAME") or ""):
                 if region == first:
                     continue
                 cfg["REGION"] = region
@@ -2975,7 +3037,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 rows = rows[-a.last:]
             print(summary_table(rows))
             return 0
-        ips = parse_ip_list(base.get("MANAGEMENT_IP"))
+        entries: Optional[List[Dict[str, str]]] = None
+        if base.get("SERVERS") and not a.management_ip:
+            entries = parse_servers(base["SERVERS"])
+            ips = [e["ip"] for e in entries]
+        else:
+            ips = parse_ip_list(base.get("MANAGEMENT_IP"))
         if a.server:
             only = parse_ip_list(a.server)
             unknown = [x for x in only if x not in ips]
@@ -2991,7 +3058,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if a.server_id_check and len(ips) > 1:
             raise AgentError("--server-id only works with one management IP; with several, put a "
                              "comma list in server_id (same order) or leave it empty")
-        cfgs = [server_config(base, ip, ips.index(ip), len(ips)) for ip in sel]
+        cfgs = [server_config(base, ip, ips.index(ip), len(ips),
+                              entry=entries[ips.index(ip)] if entries else None) for ip in sel]
         if a.cmd == "status":
             print("inputs :", base.get("_YAML_PATH") or "(no YAML file found)")
             print("home   :", HOME_DIR)

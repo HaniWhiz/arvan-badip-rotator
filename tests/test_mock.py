@@ -897,3 +897,32 @@ for extra, label in ((["--ips", "3"], "parallel"), (["--ips", "3", "--sequential
 assert [p["id"] for p in c1.ports] == ["p-mgmt-srv1"] and [p["id"] for p in cloud["srv2"].ports] == ["p-mgmt-srv2"]
 assert m.main(C + ["test", "--yes", "--ips", "2", "--dry-run"]) == 0
 print("TOTAL IPS OK")
+
+# ---- `servers:` one line per server ------------------------------------------------------------------
+sv = m.parse_servers(["bamdad, 185.1.1.10, 893DDA2F-b97d-4d75-8652-4bd7772f15dc", "185.2.2.10 qeysar",
+                      "ir-thr-c1, 185.3.3.10"])
+assert sv == [{"ip": "185.1.1.10", "region": "", "name": "bamdad", "server_id": "893dda2f-b97d-4d75-8652-4bd7772f15dc"},
+              {"ip": "185.2.2.10", "region": "", "name": "qeysar", "server_id": ""},
+              {"ip": "185.3.3.10", "region": "ir-thr-c1", "name": "", "server_id": ""}], sv
+for bad in (["bamdad"], ["bamdad 1.2.3.4", "simin 1.2.3.4"], ["bamdad 1.2.3.4 x/y"]):
+    try:
+        m.parse_servers(bad); raise SystemExit("accepted %r" % bad)
+    except m.AgentError as e:
+        print("rejected:", e)
+# the template loads, and its example lines are comments (no server set)
+tpl2 = m.load_yaml_inputs(os.path.join(repo, "arvin-agent-badip.yaml"))
+assert "SERVERS" not in tpl2, tpl2.get("SERVERS")
+# a file with servers: lines; aliases give the region, an unknown name is searched for by init
+m.ArvanAPI.call = region_call
+for f in (m.config_path(S1), m.config_path(S3)):
+    if os.path.isfile(f): os.remove(f)
+C = yaml("servers:\n  - bamdad, %s\n  - qeysar, %s   # in ir-tbz-dc1, found by init\n" % (S1, S3))
+assert m.main(C + ["init"]) == 0
+assert json.load(open(m.config_path(S1)))["REGION"] == "ir-thr-ba1"
+assert json.load(open(m.config_path(S3)))["REGION"] == other_region
+b4 = m.load_config({}, y)
+ents = m.parse_servers(b4["SERVERS"])
+assert m.server_config(b4, S3, 1, 2, entry=ents[1])["REGION"] == other_region      # saved region is used
+assert m.main(C + ["--server", S3, "status"]) == 0
+m.ArvanAPI.call = base_call
+print("SERVERS LIST OK")

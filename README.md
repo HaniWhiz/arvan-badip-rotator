@@ -70,6 +70,22 @@ nano ~/arvin-agent-badip/config.yaml
 
 ### Inputs file (`arvin-agent-badip.yaml`)
 
+The easiest way to list servers is one line each, under `servers:` at the top of the file:
+
+```yaml
+servers:
+  - bamdad,   185.1.1.10, 893dda2f-0000-0000-0000-000000000000
+  - simin,    185.3.3.30
+  - qeysar,   185.5.5.50
+```
+
+- **Datacenter:** a name (`bamdad`, `forogh`, `simin`, `shahriar`, `qeysar`) or a region code (`ir-thr-c1`). If a name is wrong or unknown, `init` searches every region for the server and remembers the one it is in.
+- **Management IP:** the server's own public IPv4. It is never released or judged.
+- **Server ID:** optional. It is the UUID in the panel URL.
+
+When `servers:` has lines, `management_ip`, `region` and `server_id` are ignored.
+
+
 All inputs are in one flat YAML file. [`arvin-agent-badip.yaml`](arvin-agent-badip.yaml) is the template, with every key commented. The script looks for it in this order:
 1. `--config PATH`
 2. `./arvin-agent-badip.yaml`
