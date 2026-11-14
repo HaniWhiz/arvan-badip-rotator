@@ -116,4 +116,5 @@ checkhost_min_spacing_sec: 30     # between any two requests, from ALL servers t
 # that check may come out unclear: then set checkhost_min_spacing_sec to 60.
 nic_appear_timeout_sec: 120
 port_active_timeout_sec: 180
-release_timeout_sec: 180
+release_timeout_sec: 600         # ArvanCloud can take several minutes to remove an IP
+release_retry_sec: 150           # ask again this often while the IP is still listed

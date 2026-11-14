@@ -164,7 +164,8 @@ DEFAULTS: Dict[str, Any] = {
     "POLICY_PRIORITY": 21000,
     "NIC_APPEAR_TIMEOUT_SEC": 120,
     "PORT_ACTIVE_TIMEOUT_SEC": 180,
-    "RELEASE_TIMEOUT_SEC": 180,
+    "RELEASE_TIMEOUT_SEC": 600,       # ArvanCloud can take several minutes to remove an IP
+    "RELEASE_RETRY_SEC": 150,         # send the release again this often while the IP is still listed
     "ALLOCATION_SETTLE_SEC": 60,
     "EGRESS_ECHO_URLS": ["https://api.ipify.org", "https://ifconfig.me/ip",
                          "https://icanhazip.com"],
@@ -2157,7 +2158,23 @@ class Agent:
             in_server = ip in ArvanAPI.server_ipv4s(self.api.get_server())
             return in_ports or in_server
 
-        gone = self._wait_for(lambda: not still_attached(), self.cfg["RELEASE_TIMEOUT_SEC"], 5)
+        deadline = time.time() + float(self.cfg["RELEASE_TIMEOUT_SEC"])
+        retry = float(self.cfg["RELEASE_RETRY_SEC"])
+        gone = False
+        while True:
+            gone = bool(self._wait_for(lambda: not still_attached(), max(1.0, min(retry, deadline - time.time())), 5))
+            if gone or time.time() >= deadline:
+                break
+            if any(x["port_id"] == port_id for x in self.api.public_inventory()):
+                self.log.warning("release_request_again", ip=ip, port_id=port_id,
+                                 detail="still attached after %ds; asking ArvanCloud again" % int(retry))
+                try:
+                    self.api.detach_port(port_id)
+                except AmbiguousRequestError as exc:
+                    self.log.warning("release_ambiguous", error=str(exc))
+                except ApiError as exc:
+                    if exc.kind != "not_found":
+                        self.log.warning("release_request_refused", ip=ip, error=str(exc))
         if not gone:
             self.log.error("release_not_confirmed", ip=ip, port_id=port_id,
                            detail="the API still lists the IP on the server; remove it in the panel")
@@ -2258,6 +2275,8 @@ class Agent:
         append_result(rec)
         self.log.info("round_result", round=n, ip=rec["ip"], verdict=rec["verdict"],
                       why=rec.get("reason") or "", regions=rec["regions_text"], released=rec["released"])
+        if not rec["released"] or rec.get("abort"):
+            getattr(self, "last_rows", []).append(rec)        # shown in this run's report
         if not rec["released"]:
             raise AbortRun("test IP %s (port %s) could NOT be confirmed released; stopping. Run "
                            "`%s cleanup --yes` or detach it in the panel" % (rec["ip"], rec["port_id"], PROJECT))
@@ -2497,7 +2516,7 @@ class Agent:
         finally:
             self.unprotect_mgmt()
         if summary:
-            print("\n" + summary_table(out))
+            print("\n" + run_report(out))
             save_state_file()
             if self.state.pending:
                 print("\n!! an allocation is still pending: run `%s cleanup --yes`" % PROJECT)
@@ -2609,7 +2628,7 @@ def latest_per_ip(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 STATE_ORDER = ["GOOD", "BAD", "MIXED", "DOWN", "INCONCLUSIVE"]
-STATE_FMT = "%-16s %-13s %-32s %-6s %-7s %-5s %-5s %-6s %s"
+STATE_FMT = "%-16s %-13s %-40s %-6s %-7s %-5s %-5s %-6s %s"
 
 
 def state_table(rows: List[Dict[str, Any]]) -> str:
@@ -2637,7 +2656,7 @@ def state_table(rows: List[Dict[str, Any]]) -> str:
             for key, _label in REGION_ORDER:
                 d = regs.get(key)
                 cells.append("%s/%s" % (d["ok"], d["ok"] + d["fail"]) if d else "-")
-            lines.append((STATE_FMT % (r["ip"], state, why[:32], *cells,
+            lines.append((STATE_FMT % (r["ip"], state, why[:40], *cells,
                                        str(r.get("finished_at") or "").replace("T", " ")[:16])).rstrip())
     lines.append("")
     for state in STATE_ORDER:
@@ -2656,6 +2675,14 @@ def state_table(rows: List[Dict[str, Any]]) -> str:
               "GOOD = reachable from Iran AND from outside Iran",
               "BAD  = Iran only (no node outside Iran reached it), or blocked in Iran (only outside did)"]
     return "\n".join(lines).lstrip("\n")
+
+
+def run_report(rows: List[Dict[str, Any]]) -> str:
+    """The IPs tested in THIS run, with their state (`state` shows every IP ever tested)."""
+    rows = [r for r in rows if r.get("ip")]
+    if not rows:
+        return "this run: no IP was tested"
+    return ("===== this run: %d IP(s) tested =====\n" % len(rows)) + state_table(latest_per_ip(rows))
 
 
 def save_state_file() -> str:
@@ -2765,7 +2792,7 @@ def run_parallel(cfgs: List[Dict[str, Any]]) -> int:
     STOP.clear()
     rows = [r for ag in agents for r in getattr(ag, "last_rows", [])]
     rows.sort(key=lambda r: (r.get("finished_at") or "", r.get("server") or ""))
-    print("\n" + summary_table(rows))
+    print("\n" + run_report(rows))
     save_state_file()
     pending = [ag.cfg["MANAGEMENT_IP"] for ag in agents if State(ag.cfg["MANAGEMENT_IP"]).pending]
     if pending:
