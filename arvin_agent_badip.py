@@ -82,7 +82,8 @@ DEFAULTS: Dict[str, Any] = {
     # One line per server: "<datacenter name or region code>, <management IP>, <server ID>".
     # Overrides management_ip / region / server_id. The server ID is optional (init finds it).
     "SERVERS": [],
-    "KNOWN_REGIONS": ["ir-thr-ba1", "ir-thr-w1", "ir-thr-c1", "ir-thr-c2", "ir-thr-at1",
+    "KNOWN_REGIONS": ["ir-thr-ba1", "ir-thr-fr1", "ir-thr-si1", "ir-tbz-sh1", "ir-southwest1-a",
+                      "eu-west1-a", "ir-thr-w1", "ir-thr-c1", "ir-thr-c2", "ir-thr-at1",
                       "ir-tbz-dc1", "ir-tbz-sh1", "nl-ams-su1"],
     "SERVER_ID": "",                  # found by `init` from the management IP
     "SERVER_NAME": "",
@@ -554,9 +555,14 @@ def load_config(overrides: Optional[Dict[str, Any]] = None,
 
 # ArvanCloud datacenter names -> region codes. Names not listed here are searched for by
 # init (in the API's region list), and the region it finds is saved for that server.
-REGION_ALIASES = {"bamdad": "ir-thr-ba1", "forogh": "ir-thr-c2", "forough": "ir-thr-c2",
-                  "simin": "ir-thr-c1", "shahriar": "ir-tbz-dc1", "herman": "nl-ams-su1"}
-REGION_CODE_RE = r"[a-z]{2}-[a-z]{2,4}-[a-z0-9]+"
+# (codes as the panel's region menu shows them; older codes such as ir-thr-c1 still work)
+REGION_ALIASES = {"bamdad": "ir-thr-ba1",
+                  "forough": "ir-thr-fr1", "forogh": "ir-thr-fr1", "forugh": "ir-thr-fr1",
+                  "simin": "ir-thr-si1",
+                  "shahriar": "ir-tbz-sh1", "shahryar": "ir-tbz-sh1",
+                  "qeysar": "ir-southwest1-a", "qaysar": "ir-southwest1-a", "gheysar": "ir-southwest1-a",
+                  "goethe": "eu-west1-a", "goethe1": "eu-west1-a"}
+REGION_CODE_RE = r"[a-z]{2}-[a-z]{2,}[0-9]*(-[a-z0-9]+)?"
 UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 
 
@@ -585,7 +591,9 @@ def parse_servers(items: Any) -> List[Dict[str, str]]:
                 raise AgentError("servers: cannot read %r in line %r (expected a datacenter name, "
                                  "an IPv4 address and optionally a server ID)" % (tok, line))
         if not e["ip"]:
-            raise AgentError("servers: line %r has no management IP" % line)
+            if e["server_id"]:
+                raise AgentError("servers: line %r has a server ID but no management IP" % line)
+            continue                       # a datacenter with no server filled in yet: skipped
         if any(x["ip"] == e["ip"] for x in out):
             raise AgentError("servers: %s is listed twice" % e["ip"])
         out.append(e)
@@ -3039,7 +3047,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         entries: Optional[List[Dict[str, str]]] = None
         if base.get("SERVERS") and not a.management_ip:
-            entries = parse_servers(base["SERVERS"])
+            entries = parse_servers(base["SERVERS"]) or None    # all lines empty: older keys
+        if entries:
             ips = [e["ip"] for e in entries]
         else:
             ips = parse_ip_list(base.get("MANAGEMENT_IP"))
@@ -3053,8 +3062,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             sel = ips
         if not sel:
-            raise AgentError("no management IP: set management_ip in the YAML file "
-                             "(one IP, or several separated by commas) or use --management-ip")
+            raise AgentError("no management IP: fill in a line under `servers:` in the YAML file "
+                             "(datacenter, management IP, server ID), or use --management-ip")
         if a.server_id_check and len(ips) > 1:
             raise AgentError("--server-id only works with one management IP; with several, put a "
                              "comma list in server_id (same order) or leave it empty")
