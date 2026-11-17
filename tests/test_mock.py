@@ -944,3 +944,20 @@ assert m.server_config(b4, S3, 1, 2, entry=ents[1])["REGION"] == other_region   
 assert m.main(C + ["--server", S3, "status"]) == 0
 m.ArvanAPI.call = base_call
 print("SERVERS LIST OK")
+
+# ---- an explicit region code the server is not in: init finds the right one, and later runs use it -----
+m.ArvanAPI.call = region_call
+if os.path.isfile(m.config_path(S3)): os.remove(m.config_path(S3))
+C = yaml("servers:\n  - ir-southwest1-a, %s\n" % S3)
+b5 = m.load_config({}, y)
+assert m.server_config(b5, S3, 0, 1, entry=m.parse_servers(b5["SERVERS"])[0])["REGION"] == "ir-southwest1-a"
+assert m.main(C + ["init"]) == 0                       # searched, found in ir-tbz-dc1, saved
+saved5 = json.load(open(m.config_path(S3)))
+assert saved5["REGION"] == other_region and saved5["REGION_REQUESTED"] == "ir-southwest1-a", saved5
+assert m.server_config(b5, S3, 0, 1, entry=m.parse_servers(b5["SERVERS"])[0])["REGION"] == other_region
+# the YAML asks for another region: that new request is used (and init would look again)
+C = yaml("servers:\n  - ir-thr-si1, %s\n" % S3)
+b6 = m.load_config({}, y)
+assert m.server_config(b6, S3, 0, 1, entry=m.parse_servers(b6["SERVERS"])[0])["REGION"] == "ir-thr-si1"
+m.ArvanAPI.call = base_call
+print("REGION REQUEST OK")

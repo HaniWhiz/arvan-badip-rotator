@@ -82,6 +82,7 @@ DEFAULTS: Dict[str, Any] = {
     # One line per server: "<datacenter name or region code>, <management IP>, <server ID>".
     # Overrides management_ip / region / server_id. The server ID is optional (init finds it).
     "SERVERS": [],
+    "REGION_REQUESTED": "",           # saved by init: the region the YAML asked for (see server_config)
     "KNOWN_REGIONS": ["ir-thr-ba1", "ir-thr-fr1", "ir-thr-si1", "ir-tbz-sh1", "ir-southwest1-a",
                       "eu-west1-a", "ir-thr-w1", "ir-thr-c1", "ir-thr-c2", "ir-thr-at1",
                       "ir-tbz-dc1", "ir-tbz-sh1", "nl-ams-su1"],
@@ -614,6 +615,7 @@ def server_config(base: Dict[str, Any], ip: str, index: int, count: int,
         cfg.update(saved)
     saved_sid = cfg.get("SERVER_ID") or ""
     saved_region = cfg.get("REGION") if os.path.isfile(p) else ""
+    cfg["_SAVED_REQUESTED"] = cfg.get("REGION_REQUESTED") or ""
     for k, v in base.items():
         if k in ("SERVER_ID", "REGION") or v == DEFAULTS.get(k, object()):
             continue
@@ -632,13 +634,18 @@ def server_config(base: Dict[str, Any], ip: str, index: int, count: int,
     cfg["MANAGEMENT_IP"] = ip
     cfg["_YAML_PATH"] = base.get("_YAML_PATH", "")
     if entry is not None:
-        # from a `servers:` line: an explicit region code wins, then the region init saved,
-        # then the datacenter name's known region; an unknown name is searched for by init.
+        # from a `servers:` line. The region asked for (a code, or a datacenter name's code) is
+        # used, unless init already looked for the server under that same request and saved
+        # the region it actually found it in. A name without a known code: init searches.
         name = entry.get("name") or ""
         cfg["SERVER_NAME"] = cfg.get("SERVER_NAME") or ""
         cfg["_DC_NAME"] = name
-        cfg["REGION"] = (entry.get("region") or saved_region or REGION_ALIASES.get(name)
-                         or DEFAULTS["REGION"])
+        requested = entry.get("region") or REGION_ALIASES.get(name) or ""
+        cfg["REGION_REQUESTED"] = requested
+        if saved_region and (not requested or cfg.get("_SAVED_REQUESTED") == requested):
+            cfg["REGION"] = saved_region
+        else:
+            cfg["REGION"] = requested or saved_region or DEFAULTS["REGION"]
         cfg["SERVER_ID"] = entry.get("server_id") or saved_sid
         return cfg
     # server_id may be one UUID (single server) or a comma list in the same order as the IPs
@@ -2076,7 +2083,8 @@ class Agent:
         # 2) VM side over SSH (ssh mode only; panel mode never logs in to the VM)
         if self.panel:
             _write_json_atomic(config_path(mgmt_ip), {k: cfg[k] for k in (
-                "REGION", "SERVER_ID", "SERVER_NAME", "MANAGEMENT_IP", "MANAGEMENT_PORT_ID")})
+                "REGION", "REGION_REQUESTED", "SERVER_ID", "SERVER_NAME", "MANAGEMENT_IP",
+                "MANAGEMENT_PORT_ID")})
             print("mode     : panel (ArvanCloud configures new IPs on the VM; no ssh is used)")
             print("saved    : %s" % config_path(mgmt_ip))
             return 0
@@ -2093,7 +2101,7 @@ class Agent:
         print("VM side  : iface=%s cidr=%s gw=%s  (ssh %s@%s ok)"
               % (cfg["MANAGEMENT_IFACE"] or "?", cfg["MANAGEMENT_CIDR"] or "?",
                  cfg["MANAGEMENT_GATEWAY"] or "?", cfg["SSH_USER"], mgmt_ip))
-        keep = {k: cfg[k] for k in ("REGION", "SERVER_ID", "SERVER_NAME", "MANAGEMENT_IP",
+        keep = {k: cfg[k] for k in ("REGION", "REGION_REQUESTED", "SERVER_ID", "SERVER_NAME", "MANAGEMENT_IP",
                                     "MANAGEMENT_PORT_ID", "MANAGEMENT_IFACE", "MANAGEMENT_GATEWAY",
                                     "MANAGEMENT_CIDR", "PROTECT_MGMT_ROUTE")}
         _write_json_atomic(config_path(mgmt_ip), keep)

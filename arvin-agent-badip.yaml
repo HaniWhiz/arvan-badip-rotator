@@ -12,29 +12,24 @@
 #   security add-generic-password -U -a "$USER" -s arvin-agent-badip -w
 
 # =============================================================================
-# YOUR SERVERS: one line per datacenter
+# YOUR SERVERS: one line per region
 # =============================================================================
-# Fill in each line:   - <datacenter>, <management IP>, <server ID>
+# Fill in each line:   - <region>, <management IP>, <server ID>
 #
+#   region         as in the panel's region menu (ir-thr-ba1 = bamdad, ir-thr-fr1 = forough,
+#                  ir-thr-si1 = simin, ir-southwest1-a = qeysar, ir-tbz-sh1 = shahriar)
 #   management IP  the server's own public IPv4 (never released, never judged)
 #   server ID      the UUID in the panel URL: .../servers/<server ID>/details
 #                  (optional: leave it empty and `init` finds the server by its IP)
 #
 # A line with no management IP yet is skipped, so fill in only the servers you have.
 # Run `init` after filling in a line.
-#
-#   datacenter   region code (panel region menu)
-#   bamdad       ir-thr-ba1
-#   forough      ir-thr-fr1
-#   simin        ir-thr-si1
-#   shahriar     ir-tbz-sh1
-#   qeysar       ir-southwest1-a
 servers:
-  - bamdad,   ,
-  - forough,  ,
-  - simin,    ,
-  - shahriar, ,
-  - qeysar,   ,
+  - ir-thr-ba1,      ,
+  - ir-thr-fr1,      ,
+  - ir-thr-si1,      ,
+  - ir-southwest1-a, ,
+  - ir-tbz-sh1,      ,
 
 # (Older form, used only when `servers:` above is empty: comma lists in the same order.)
 management_ip: ""
