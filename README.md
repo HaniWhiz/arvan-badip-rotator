@@ -74,14 +74,14 @@ The easiest way to list servers is one line each, under `servers:` at the top of
 
 ```yaml
 servers:
-  - bamdad,   185.1.1.10, 893dda2f-0000-0000-0000-000000000000
-  - forough,  ,
-  - simin,    185.3.3.30
-  - shahriar, ,
-  - qeysar,   185.5.5.50
+  - ir-thr-ba1,      185.1.1.10, 893dda2f-0000-0000-0000-000000000000
+  - ir-thr-fr1,      ,
+  - ir-thr-si1,      185.3.3.30
+  - ir-southwest1-a, 185.5.5.50
+  - ir-tbz-sh1,      ,
 ```
 
-- **Datacenter:** a name or a region code, as in the panel's region menu:
+- **Region:** the region code from the panel's region menu. The datacenter name works too:
 
   | Name | Region code |
   |---|---|
