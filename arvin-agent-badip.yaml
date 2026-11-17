@@ -12,28 +12,37 @@
 #   security add-generic-password -U -a "$USER" -s arvin-agent-badip -w
 
 # =============================================================================
-# YOUR SERVERS: one line per region
+# YOUR SERVERS: one block per region
 # =============================================================================
-# Fill in each line:   - <region>, <management IP>, <server ID>
+# Fill in a block for each server you have:
 #
+#   management_ip  the server's own public IPv4 (never released, never judged)
 #   region         as in the panel's region menu (ir-thr-ba1 = bamdad, ir-thr-fr1 = forough,
-#                  ir-thr-si1 = simin, ir-southwest1-a = qeysar, ir-tbz-sh1 = shahriar)
-#   management IP  the server's own public IPv4 (never released, never judged)
-#   server ID      the UUID in the panel URL: .../servers/<server ID>/details
-#                  (optional: leave it empty and `init` finds the server by its IP)
+#                  ir-southwest1-a = qeysar, ir-thr-si1 = simin, ir-tbz-sh1 = shahriar)
+#   server_id      the UUID in the panel URL: .../servers/<server_id>/details
+#                  (optional: leave it "" and `init` finds the server by its IP)
 #
-# A line with no management IP yet is skipped, so fill in only the servers you have.
-# Run `init` after filling in a line.
-servers:
-  - ir-thr-ba1,      ,
-  - ir-thr-fr1,      ,
-  - ir-thr-si1,      ,
-  - ir-southwest1-a, ,
-  - ir-tbz-sh1,      ,
+# A block with management_ip "" is skipped, so fill in only the servers you have.
+# Run `init` after filling in a block.
 
-# (Older form, used only when `servers:` above is empty: comma lists in the same order.)
 management_ip: ""
 region: ir-thr-ba1
+server_id: ""
+
+management_ip: ""
+region: ir-thr-fr1
+server_id: ""
+
+management_ip: ""
+region: ir-southwest1-a
+server_id: ""
+
+management_ip: ""
+region: ir-thr-si1
+server_id: ""
+
+management_ip: ""
+region: ir-tbz-sh1
 server_id: ""
 
 # How a new IP gets configured on the server:

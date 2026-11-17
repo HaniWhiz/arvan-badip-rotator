@@ -914,7 +914,7 @@ for bad in (["bamdad 1.2.3.4", "simin 1.2.3.4"], ["bamdad 1.2.3.4 x/y"]):
         print("rejected:", e)
 # the template loads, and its example lines are comments (no server set)
 tpl2 = m.load_yaml_inputs(os.path.join(repo, "arvin-agent-badip.yaml"))
-assert len(tpl2["SERVERS"]) == 5 and m.parse_servers(tpl2["SERVERS"]) == [], tpl2.get("SERVERS")
+assert tpl2.get("SERVERS") is None and "MANAGEMENT_IP" not in tpl2, tpl2      # 5 empty blocks: no server
 # panel region codes, and lines not filled in yet
 assert m.parse_servers(["bamdad, ,", "qeysar, 1.2.3.4", "ir-southwest1-a 5.6.7.8"]) == [
     {"ip": "1.2.3.4", "region": "", "name": "qeysar", "server_id": ""},
@@ -961,3 +961,47 @@ b6 = m.load_config({}, y)
 assert m.server_config(b6, S3, 0, 1, entry=m.parse_servers(b6["SERVERS"])[0])["REGION"] == "ir-thr-si1"
 m.ArvanAPI.call = base_call
 print("REGION REQUEST OK")
+
+# ---- one block per server: management_ip / region / server_id repeated -----------------------------
+open(y, "w").write("""
+management_ip: "%s"
+region: ir-thr-ba1
+server_id: "893dda2f-b97d-4d75-8652-4bd7772f15dc"
+
+management_ip: ""
+region: ir-thr-fr1
+server_id: ""
+
+management_ip: "%s"
+region: ir-southwest1-a
+server_id: ""
+
+rounds: 2
+""" % (S1, S3))
+d7 = m.load_yaml_inputs(y)
+assert d7["SERVERS"] == ["ir-thr-ba1, %s, 893dda2f-b97d-4d75-8652-4bd7772f15dc" % S1,
+                         "ir-southwest1-a, %s" % S3], d7
+assert "MANAGEMENT_IP" not in d7 and "REGION" not in d7 and d7["ROUNDS"] == 2
+assert [e["ip"] for e in m.parse_servers(d7["SERVERS"])] == [S1, S3]
+# a single block is the ordinary single-server form
+open(y, "w").write('management_ip: "%s"\nregion: ir-thr-ba1\n' % S1)
+d8 = m.load_yaml_inputs(y)
+assert d8["MANAGEMENT_IP"] == S1 and "SERVERS" not in d8, d8
+# blocks run end to end: init searches for the server whose region is wrong
+m.ArvanAPI.call = region_call
+for f in (m.config_path(S1), m.config_path(S3)):
+    if os.path.isfile(f): os.remove(f)
+open(y, "w").write('management_ip: "%s"\nregion: ir-thr-ba1\nserver_id: ""\n\n'
+                   'management_ip: "%s"\nregion: ir-southwest1-a\nserver_id: ""\n' % (S1, S3))
+C = ["--config", y]
+assert m.main(C + ["init"]) == 0
+assert json.load(open(m.config_path(S3)))["REGION"] == other_region
+assert m.main(C + ["status"]) == 0
+# bad values are refused with the line number
+open(y, "w").write('management_ip: "1.2.3.4, 5.6.7.8"\nregion: a-b-c\nmanagement_ip: "9.9.9.9"\n')
+try:
+    m.load_yaml_inputs(y); raise SystemExit("accepted two IPs in one block")
+except m.AgentError as e:
+    print("rejected:", e)
+m.ArvanAPI.call = base_call
+print("SERVER BLOCKS OK")
