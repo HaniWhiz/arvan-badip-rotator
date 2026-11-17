@@ -70,33 +70,34 @@ nano ~/arvin-agent-badip/config.yaml
 
 ### Inputs file (`arvin-agent-badip.yaml`)
 
-The easiest way to list servers is one line each, under `servers:` at the top of the file:
+Each server is one block of three lines. Repeat the block for every server:
 
 ```yaml
-servers:
-  - ir-thr-ba1,      185.1.1.10, 893dda2f-0000-0000-0000-000000000000
-  - ir-thr-fr1,      ,
-  - ir-thr-si1,      185.3.3.30
-  - ir-southwest1-a, 185.5.5.50
-  - ir-tbz-sh1,      ,
+management_ip: "185.1.1.10"
+region: ir-thr-ba1
+server_id: "893dda2f-0000-0000-0000-000000000000"
+
+management_ip: "185.5.5.50"
+region: ir-southwest1-a
+server_id: ""
 ```
 
-- **Region:** the region code from the panel's region menu. The datacenter name works too:
+- **management_ip:** the server's own public IPv4. It is never released or judged. A block with `management_ip: ""` is skipped.
+- **region:** the code from the panel's region menu:
 
-  | Name | Region code |
+  | Datacenter | Region code |
   |---|---|
-  | `bamdad` | `ir-thr-ba1` |
-  | `forough` | `ir-thr-fr1` |
-  | `simin` | `ir-thr-si1` |
-  | `shahriar` | `ir-tbz-sh1` |
-  | `qeysar` | `ir-southwest1-a` |
+  | Bamdad | `ir-thr-ba1` |
+  | Forough | `ir-thr-fr1` |
+  | Qeysar | `ir-southwest1-a` |
+  | Simin | `ir-thr-si1` |
+  | Shahriar | `ir-tbz-sh1` |
 
-  If a name or code is wrong, `init` searches every region for the server and remembers the one it is in.
-- **Empty lines:** a line with no management IP yet (`- forough, ,`) is skipped.
-- **Management IP:** the server's own public IPv4. It is never released or judged.
-- **Server ID:** optional. It is the UUID in the panel URL.
+  If it's wrong, `init` searches every region for the server and remembers the one it is in.
+- **server_id:** optional. It is the UUID in the panel URL; without it, `init` finds the server by its IP.
 
-When `servers:` has lines, `management_ip`, `region` and `server_id` are ignored.
+The template has an empty block for each region. A one-line-per-server form also works (`servers:` with lines such as `- ir-thr-ba1, 185.1.1.10, <server id>`).
+
 
 
 All inputs are in one flat YAML file. [`arvin-agent-badip.yaml`](arvin-agent-badip.yaml) is the template, with every key commented. The script looks for it in this order:

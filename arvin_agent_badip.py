@@ -442,7 +442,14 @@ def _yaml_split(s: str) -> List[str]:
     return [x.strip() for x in out]
 
 
-def parse_simple_yaml(text: str, src: str = "yaml") -> Dict[str, Any]:
+# These keys may repeat: each `management_ip:` starts a block for one more server.
+SERVER_BLOCK_KEYS = ("management_ip", "region", "server_id")
+
+
+def parse_simple_yaml(text: str, src: str = "yaml",
+                      blocks: Optional[List[Tuple[str, Any, str]]] = None) -> Dict[str, Any]:
+    """Flat YAML -> dict. If `blocks` is given, every management_ip / region / server_id line
+    is also appended to it as (key, value, where), and those keys may repeat."""
     data: Dict[str, Any] = {}
     list_key: Optional[str] = None
     for n, raw in enumerate(text.splitlines(), 1):
@@ -463,7 +470,11 @@ def parse_simple_yaml(text: str, src: str = "yaml") -> Dict[str, Any]:
         if not m:
             raise AgentError("%s: expected 'key: value', got %r" % (where, line))
         key, val = m.group(1), (m.group(3) or "")
-        if key in data:
+        if blocks is not None and key in SERVER_BLOCK_KEYS:
+            blocks.append((key, _yaml_scalar(val, where) if val.strip() else None, where))
+            if key in data:
+                continue                       # repeated in a later server block
+        elif key in data:
             raise AgentError("%s: duplicate key %r" % (where, key))
         if val.strip() == "":
             data[key], list_key = [], key       # may become a block list; fixed below
@@ -501,9 +512,50 @@ def parse_region_spec(text: str) -> Dict[str, List[str]]:
     return out
 
 
+def server_blocks(blocks: List[Tuple[str, Any, str]]) -> Optional[List[str]]:
+    """Repeated management_ip / region / server_id blocks -> `servers:` lines
+    ("region, ip, id"). A key that appears again starts the next block. Blocks with no
+    management_ip are skipped. Returns None when no key repeats (the single-value form)."""
+    counts: Dict[str, int] = {}
+    for key, _v, _w in blocks:
+        counts[key] = counts.get(key, 0) + 1
+    if not any(n > 1 for n in counts.values()):
+        return None
+    groups: List[Dict[str, Any]] = []
+    cur: Dict[str, Any] = {}
+    for key, val, where in blocks:
+        if key in cur:
+            groups.append(cur)
+            cur = {}
+        cur[key] = (val, where)
+    if cur:
+        groups.append(cur)
+    lines = []
+    for g in groups:
+        ip, where = g.get("management_ip", (None, ""))
+        if not str(ip or "").strip():
+            continue                            # a server not filled in yet
+        if not _is_ipv4(str(ip).strip()):
+            raise AgentError("%s: management_ip %r must be one IPv4 address in a server block"
+                             % (where, ip))
+        region = str((g.get("region") or ("", ""))[0] or "").strip()
+        sid = str((g.get("server_id") or ("", ""))[0] or "").strip()
+        lines.append(", ".join(x for x in (region, str(ip).strip(), sid) if x))
+    return lines
+
+
 def load_yaml_inputs(path: str) -> Dict[str, Any]:
+    blocks: List[Tuple[str, Any, str]] = []
     with open(path, encoding="utf-8") as fh:
-        raw = parse_simple_yaml(fh.read(), path)
+        raw = parse_simple_yaml(fh.read(), path, blocks)
+    from_blocks = server_blocks(blocks)
+    if from_blocks is not None:
+        for k in SERVER_BLOCK_KEYS:             # the blocks replace the single-value keys
+            raw.pop(k, None)
+        listed = raw.get("servers") or []
+        raw["servers"] = (listed if isinstance(listed, list) else [listed]) + from_blocks
+        if not raw["servers"]:
+            raw["servers"] = None
     out: Dict[str, Any] = {}
     unknown = []
     for k, v in raw.items():
@@ -3070,8 +3122,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             sel = ips
         if not sel:
-            raise AgentError("no management IP: fill in a line under `servers:` in the YAML file "
-                             "(datacenter, management IP, server ID), or use --management-ip")
+            raise AgentError("no management IP: fill in management_ip in one of the server blocks "
+                             "of the YAML file, or use --management-ip")
         if a.server_id_check and len(ips) > 1:
             raise AgentError("--server-id only works with one management IP; with several, put a "
                              "comma list in server_id (same order) or leave it empty")
