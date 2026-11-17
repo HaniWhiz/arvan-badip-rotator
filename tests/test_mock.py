@@ -798,6 +798,8 @@ def region_call(self, method, url, body=None, idempotent=None, allow_404=False, 
     region_calls.append(region)
     if "/servers/nope" in url:                       # an ID that exists in no region
         raise m.ApiError(method, url, 404, "Instance not found", None)
+    if region not in ("ir-thr-ba1", other_region):   # nothing of ours in the other regions
+        raise m.ApiError(method, url, 404, "Not Found", None)
     if region == other_region:
         path = url.split("/regions/" + other_region)[1]
         if method == "GET" and path == "/servers":
@@ -904,19 +906,35 @@ sv = m.parse_servers(["bamdad, 185.1.1.10, 893DDA2F-b97d-4d75-8652-4bd7772f15dc"
 assert sv == [{"ip": "185.1.1.10", "region": "", "name": "bamdad", "server_id": "893dda2f-b97d-4d75-8652-4bd7772f15dc"},
               {"ip": "185.2.2.10", "region": "", "name": "qeysar", "server_id": ""},
               {"ip": "185.3.3.10", "region": "ir-thr-c1", "name": "", "server_id": ""}], sv
-for bad in (["bamdad"], ["bamdad 1.2.3.4", "simin 1.2.3.4"], ["bamdad 1.2.3.4 x/y"]):
+assert m.parse_servers(["bamdad"]) == []                  # not filled in yet: skipped
+for bad in (["bamdad 1.2.3.4", "simin 1.2.3.4"], ["bamdad 1.2.3.4 x/y"]):
     try:
         m.parse_servers(bad); raise SystemExit("accepted %r" % bad)
     except m.AgentError as e:
         print("rejected:", e)
 # the template loads, and its example lines are comments (no server set)
 tpl2 = m.load_yaml_inputs(os.path.join(repo, "arvin-agent-badip.yaml"))
-assert "SERVERS" not in tpl2, tpl2.get("SERVERS")
+assert len(tpl2["SERVERS"]) == 5 and m.parse_servers(tpl2["SERVERS"]) == [], tpl2.get("SERVERS")
+# panel region codes, and lines not filled in yet
+assert m.parse_servers(["bamdad, ,", "qeysar, 1.2.3.4", "ir-southwest1-a 5.6.7.8"]) == [
+    {"ip": "1.2.3.4", "region": "", "name": "qeysar", "server_id": ""},
+    {"ip": "5.6.7.8", "region": "ir-southwest1-a", "name": "", "server_id": ""}]
+assert m.REGION_ALIASES["qeysar"] == "ir-southwest1-a" and m.REGION_ALIASES["forough"] == "ir-thr-fr1"
+try:
+    m.parse_servers(["simin, , d1d55623-8ef2-441e-b8f1-61c2db57824b"]); raise SystemExit("accepted")
+except m.AgentError as e:
+    print("rejected:", e)
+# every line empty: the older management_ip key is used
+C = yaml("servers:\n  - bamdad, ,\n  - simin, ,\nmanagement_ip: %s\n" % S1)
+assert m.main(C + ["status"]) == 0
+C = yaml("servers:\n  - bamdad, ,\n")
+assert m.main(C + ["status"]) == 1
 # a file with servers: lines; aliases give the region, an unknown name is searched for by init
 m.ArvanAPI.call = region_call
 for f in (m.config_path(S1), m.config_path(S3)):
     if os.path.isfile(f): os.remove(f)
-C = yaml("servers:\n  - bamdad, %s\n  - qeysar, %s   # in ir-tbz-dc1, found by init\n" % (S1, S3))
+# qeysar's region is ir-southwest1-a, but this server is in ir-tbz-dc1: init searches and finds it
+C = yaml("servers:\n  - bamdad, %s\n  - qeysar, %s\n" % (S1, S3))
 assert m.main(C + ["init"]) == 0
 assert json.load(open(m.config_path(S1)))["REGION"] == "ir-thr-ba1"
 assert json.load(open(m.config_path(S3)))["REGION"] == other_region

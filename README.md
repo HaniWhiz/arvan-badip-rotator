@@ -75,11 +75,24 @@ The easiest way to list servers is one line each, under `servers:` at the top of
 ```yaml
 servers:
   - bamdad,   185.1.1.10, 893dda2f-0000-0000-0000-000000000000
+  - forough,  ,
   - simin,    185.3.3.30
+  - shahriar, ,
   - qeysar,   185.5.5.50
 ```
 
-- **Datacenter:** a name (`bamdad`, `forogh`, `simin`, `shahriar`, `qeysar`) or a region code (`ir-thr-c1`). If a name is wrong or unknown, `init` searches every region for the server and remembers the one it is in.
+- **Datacenter:** a name or a region code, as in the panel's region menu:
+
+  | Name | Region code |
+  |---|---|
+  | `bamdad` | `ir-thr-ba1` |
+  | `forough` | `ir-thr-fr1` |
+  | `simin` | `ir-thr-si1` |
+  | `shahriar` | `ir-tbz-sh1` |
+  | `qeysar` | `ir-southwest1-a` |
+
+  If a name or code is wrong, `init` searches every region for the server and remembers the one it is in.
+- **Empty lines:** a line with no management IP yet (`- forough, ,`) is skipped.
 - **Management IP:** the server's own public IPv4. It is never released or judged.
 - **Server ID:** optional. It is the UUID in the panel URL.
 

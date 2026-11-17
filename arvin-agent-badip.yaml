@@ -12,23 +12,29 @@
 #   security add-generic-password -U -a "$USER" -s arvin-agent-badip -w
 
 # =============================================================================
-# YOUR SERVERS: one line per server
+# YOUR SERVERS: one line per datacenter
 # =============================================================================
-#   - <datacenter>, <management IP>, <server ID>
+# Fill in each line:   - <datacenter>, <management IP>, <server ID>
 #
-# datacenter: bamdad, forogh, simin, shahriar, qeysar (or a region code such as ir-thr-c1).
-#             A name the script does not know is looked up by `init`, which then remembers it.
-# management IP: the server's own public IPv4 (never released, never judged).
-# server ID: optional; the UUID in the panel URL (.../servers/<server ID>/details).
-#            Leave it out and `init` finds the server by its IP.
-# Remove a server by deleting its line, or put # in front of it. Run `init` after adding one.
-# Example (remove the # in front of each line and put your own values):
+#   management IP  the server's own public IPv4 (never released, never judged)
+#   server ID      the UUID in the panel URL: .../servers/<server ID>/details
+#                  (optional: leave it empty and `init` finds the server by its IP)
+#
+# A line with no management IP yet is skipped, so fill in only the servers you have.
+# Run `init` after filling in a line.
+#
+#   datacenter   region code (panel region menu)
+#   bamdad       ir-thr-ba1
+#   forough      ir-thr-fr1
+#   simin        ir-thr-si1
+#   shahriar     ir-tbz-sh1
+#   qeysar       ir-southwest1-a
 servers:
-#  - bamdad,   185.1.1.10, 00000000-0000-0000-0000-000000000000
-#  - forogh,   185.2.2.20
-#  - simin,    185.3.3.30
-#  - shahriar, 185.4.4.40
-#  - qeysar,   185.5.5.50
+  - bamdad,   ,
+  - forough,  ,
+  - simin,    ,
+  - shahriar, ,
+  - qeysar,   ,
 
 # (Older form, used only when `servers:` above is empty: comma lists in the same order.)
 management_ip: ""
